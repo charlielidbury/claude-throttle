@@ -57,7 +57,7 @@ written by `statusline.sh` — Claude Code pipes the same `rate_limits`
 field that powers `/usage`. A single sleep is capped at 540s; longer
 catchup spans multiple tool calls.
 
-If the cache is stale (>5min) or has no `rate_limits` (cold start, no
+If the cache is stale (>30min) or has no `rate_limits` (cold start, no
 API response yet), the hook is a no-op.
 
 ## Tuning
@@ -67,7 +67,7 @@ API response yet), the hook is a no-op.
 | `CLAUDE_THROTTLE` | unset | Multiplier (0, 1]. Required to engage. |
 | `MAX_SLEEP` | 540 | Per-call sleep cap, seconds. |
 | `WARMUP_THRESHOLD_PCT` | 10 | Skip pacing while a window's util < this %. |
-| `MAX_CACHE_AGE_S` | 300 | Treat older cache as missing. |
+| `MAX_CACHE_AGE_S` | 1800 | Treat older cache as missing. |
 | `THROTTLE_LOG` | `~/.claude/throttle.log` | Log path. |
 | `CLAUDE_THROTTLE_CACHE` | `/tmp/claude-throttle-cache.json` | Cache path. |
 | `CLAUDE_THROTTLE_STATS_DIR` | `/tmp` | Per-session stats files live here. |

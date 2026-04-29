@@ -83,9 +83,13 @@ Two facts about statusLine cadence we have to design around:
    purposes — within a single tool-heavy turn the utilization rarely
    moves more than 1–2 percentage points.
 
-The hook treats cache older than `MAX_CACHE_AGE_S` (default 300s) as
-missing — stale enough that it's better to fail open than pace on
-old data.
+The hook treats cache older than `MAX_CACHE_AGE_S` (default 1800s,
+30 min) as missing — stale enough that it's better to fail open than
+pace on old data. Originally 300s, raised after observing real-world
+cadence: statusLine inter-update gaps are bimodal (bursts under 10s,
+or 5-10+ min droughts during tool-heavy turns), and 5 min was
+throwing away half the long gaps. Utilization moves slowly enough
+that 30 min of staleness is still acceptable.
 
 ### Why not the `/api/oauth/usage` endpoint?
 
@@ -245,7 +249,7 @@ PreToolUse hook. Responsibilities:
 - Exit 0 immediately if `CLAUDE_THROTTLE` is unset, empty, zero, or
   non-numeric.
 - Read the cache file. If missing, exit 0 (no data, can't pace).
-- If cache is older than `MAX_CACHE_AGE_S` (default 300), exit 0.
+- If cache is older than `MAX_CACHE_AGE_S` (default 1800), exit 0.
 - If `rate_limits` is null (cold start), exit 0.
 - For each window (`five_hour`, `seven_day`):
   - If `used_percentage < WARMUP_THRESHOLD_PCT` (default 10), skip.
@@ -265,7 +269,7 @@ Inputs:
 - env `MAX_SLEEP`: cap on a single sleep (default 540).
 - env `WARMUP_THRESHOLD_PCT`: utilization percent below which pacing is
   bypassed for a given window (default 10).
-- env `MAX_CACHE_AGE_S`: cache freshness limit (default 300).
+- env `MAX_CACHE_AGE_S`: cache freshness limit (default 1800).
 - env `THROTTLE_LOG`: log file path (default `~/.claude/throttle.log`).
 - env `CLAUDE_THROTTLE_CACHE`: cache file path (default
   `/tmp/claude-throttle-cache.json`).
@@ -482,14 +486,18 @@ Drive a real Claude Code session via tmux:
 
 ### Q1: Cache age limit
 
-Default `MAX_CACHE_AGE_S=300` is a guess. statusLine ticks fire on
-assistant-message updates, not on a timer, so during a tool-heavy turn
-the cache could be 30–60s stale. Setting too low means we frequently
-fail open during long tool sequences; setting too high means we pace
-on data that no longer reflects reality.
+Originally 300s, raised to 1800s (30 min) after instrumenting one
+session of ~4.5h real use:
+- 41 distinct cache updates seen in the throttle log
+- Bimodal inter-update gaps: ~35% under 10s (rendering bursts),
+  ~30% in the 5–10 min range (tool-heavy turns), longest 57 min
+- Median 222s, mean 400s. At 300s threshold, ~50% of long gaps
+  were thrown away as stale, leaving the throttle effectively off
+  during tool-heavy stretches.
 
-Recommendation: ship at 300s, instrument the throttle log to record
-cache age on every decision, tune based on real data.
+30 min still excludes the truly stale outliers (the 57 min gap)
+without sacrificing actionable signal. Utilization moves slowly
+enough that 30 min of staleness is acceptable.
 
 ### Q2: Wrapper recipe for users with existing statusLine
 
