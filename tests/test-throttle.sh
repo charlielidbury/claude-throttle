@@ -36,6 +36,8 @@ LOG_FILE="$WORK/throttle.log"
 STDOUT_FILE="$WORK/stdout"
 STDERR_FILE="$WORK/stderr"
 SLEEP_RECORD="$WORK/sleep_record"
+STATS_DIR="$WORK/stats"
+mkdir -p "$STATS_DIR"
 
 TESTS_RUN=0
 TESTS_FAILED=0
@@ -44,6 +46,7 @@ LAST_EXIT=0
 
 reset_state() {
   rm -f "$CACHE_FILE" "$LOG_FILE" "$STDOUT_FILE" "$STDERR_FILE" "$SLEEP_RECORD"
+  rm -f "$STATS_DIR"/*.json 2>/dev/null || true
 }
 
 # Build a cache file at $CACHE_FILE.
@@ -93,11 +96,14 @@ write_cache_raw() {
 }
 
 run_throttle() {
+  # Optional first arg: stdin input string. Default: empty stdin.
+  local stdin_input="${1:-}"
   PATH="$MOCK_BIN:$PATH" \
     THROTTLE_LOG="$LOG_FILE" \
     CLAUDE_THROTTLE_CACHE="$CACHE_FILE" \
+    CLAUDE_THROTTLE_STATS_DIR="$STATS_DIR" \
     SLEEP_RECORD="$SLEEP_RECORD" \
-    "$THROTTLE_SH" </dev/null >"$STDOUT_FILE" 2>"$STDERR_FILE"
+    "$THROTTLE_SH" <<<"$stdin_input" >"$STDOUT_FILE" 2>"$STDERR_FILE"
   LAST_EXIT=$?
 }
 
@@ -193,6 +199,59 @@ assert d["systemMessage"]
 ' < "$STDOUT_FILE" 2>/dev/null; then
     fail_msg "stdout is not valid JSON with non-empty systemMessage"
     return 1
+  fi
+}
+
+# Stats helpers — assert per-session stats file state in $STATS_DIR.
+stats_file_for() {
+  printf '%s/claude-throttle-stats-%s.json' "$STATS_DIR" "$1"
+}
+
+assert_no_stats_files() {
+  local count
+  count=$(find "$STATS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | wc -l)
+  if (( count > 0 )); then
+    fail_msg "expected no stats files; found $count: $(ls "$STATS_DIR")"
+    return 1
+  fi
+}
+
+# assert_stats <sid> <expected_count> <expected_total_sleep_s>
+assert_stats() {
+  local sid="$1" want_count="$2" want_total="$3"
+  local file
+  file=$(stats_file_for "$sid")
+  if [[ ! -f "$file" ]]; then
+    fail_msg "expected stats file $file"
+    return 1
+  fi
+  python3 - "$file" "$want_count" "$want_total" <<'PY' 2>/dev/null
+import json, sys
+file, want_count, want_total = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
+with open(file) as f:
+    d = json.load(f)
+assert isinstance(d, dict), f"not an object: {d!r}"
+assert int(d.get("throttle_count", -1)) == want_count, f"count: {d.get('throttle_count')} vs {want_count}"
+got_total = float(d.get("total_sleep_s", -1))
+assert abs(got_total - want_total) < 0.5, f"total: {got_total} vs {want_total}"
+assert isinstance(d.get("last_sleep_at"), int), f"last_sleep_at: {d.get('last_sleep_at')!r}"
+PY
+  if (( $? != 0 )); then
+    fail_msg "stats file mismatch (sid=$sid want_count=$want_count want_total=$want_total)"
+    if [[ -f "$file" ]]; then
+      echo "  contents: $(cat "$file")"
+    fi
+    return 1
+  fi
+}
+
+# Build a PreToolUse-style JSON payload with the given session_id (or no key if "absent").
+make_input() {
+  local sid="${1:-absent}"
+  if [[ "$sid" == "absent" ]]; then
+    echo '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{}}'
+  else
+    printf '{"session_id":"%s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{}}' "$sid"
   fi
 }
 
@@ -422,6 +481,59 @@ test_stdout_json_validity() {
     && assert_stdout_valid_systemmessage
 }
 
+# 20. Stats file is created on first sleep when session_id is in stdin
+test_stats_first_sleep() {
+  reset_state
+  write_cache 0 20 16200   # ahead-of-pace, sleep capped to 540
+  CLAUDE_THROTTLE="1.0" run_throttle "$(make_input s-001)"
+  assert_exit_zero \
+    && assert_sleep_eq 540 \
+    && assert_stats "s-001" 1 540
+}
+
+# 21. Two consecutive sleeps in the same session: counter=2, total summed
+test_stats_two_sleeps() {
+  reset_state
+  write_cache 0 20 16200
+  CLAUDE_THROTTLE="1.0" run_throttle "$(make_input s-002)"
+  assert_exit_zero || return 1
+  # second invocation in same session, same canned cache
+  write_cache 0 20 16200
+  CLAUDE_THROTTLE="1.0" run_throttle "$(make_input s-002)"
+  assert_exit_zero \
+    && assert_stats "s-002" 2 1080
+}
+
+# 22. Sleep with malformed stdin (no session_id): sleep happens, no stats file
+test_stats_no_session_id() {
+  reset_state
+  write_cache 0 20 16200
+  CLAUDE_THROTTLE="1.0" run_throttle "$(make_input absent)"
+  assert_exit_zero \
+    && assert_sleep_eq 540 \
+    && assert_no_stats_files
+}
+
+# 23. Throttle disabled: no stats writing even with session_id
+test_stats_throttle_disabled() {
+  reset_state
+  write_cache 0 20 16200
+  CLAUDE_THROTTLE="" run_throttle "$(make_input s-003)"
+  assert_exit_zero \
+    && assert_no_sleep \
+    && assert_no_stats_files
+}
+
+# 24. Skip path doesn't write stats (behind pace, has session_id)
+test_stats_skip_path_no_write() {
+  reset_state
+  write_cache 0 25 9000  # behind pace
+  CLAUDE_THROTTLE="1.0" run_throttle "$(make_input s-004)"
+  assert_exit_zero \
+    && assert_no_sleep \
+    && assert_no_stats_files
+}
+
 # --- run all tests ---
 
 run "throttle disabled (unset)"        test_disabled_unset
@@ -443,6 +555,11 @@ run "7d resets_at null, 5h paces"      test_7d_resets_at_null
 run "7d entirely missing, 5h paces"    test_missing_7d
 run "invalid cache JSON"               test_invalid_cache_json
 run "stdout valid JSON systemMessage"  test_stdout_json_validity
+run "stats: first sleep writes stats"  test_stats_first_sleep
+run "stats: two sleeps accumulate"     test_stats_two_sleeps
+run "stats: no session_id, no stats"   test_stats_no_session_id
+run "stats: throttle disabled, none"   test_stats_throttle_disabled
+run "stats: skip path, no stats"       test_stats_skip_path_no_write
 
 echo
 echo "----"

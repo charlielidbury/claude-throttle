@@ -5,6 +5,10 @@
 # current rate-limit utilization is ahead of the linear-pacing target,
 # and sleeps before allowing the tool call if so.
 #
+# After a non-zero sleep, increments a per-session stats file at
+# ${CLAUDE_THROTTLE_STATS_DIR:-/tmp}/claude-throttle-stats-<session_id>.json
+# so statusline.sh can surface a summary in the status bar.
+#
 # Activation: set CLAUDE_THROTTLE to a positive number in (0, 1].
 # Unset, empty, zero, or non-numeric values disable the hook (exit 0).
 set -u
@@ -17,14 +21,30 @@ if ! python3 -c 'import sys; v=float(sys.argv[1]); sys.exit(0 if v > 0 else 1)' 
   exit 0
 fi
 
-# Discard the PreToolUse JSON event — we don't need its contents.
-cat >/dev/null 2>/dev/null || true
+# Read the PreToolUse JSON event so we can extract session_id for the
+# per-session stats file. Pacing math doesn't need it; if parsing fails,
+# session_id stays empty and stats writes are silently skipped.
+input=$(cat 2>/dev/null) || input=""
+session_id=$(printf '%s' "$input" | python3 -c '
+import json, re, sys
+try:
+    d = json.loads(sys.stdin.read())
+    sid = d.get("session_id")
+    if isinstance(sid, str):
+        sid = re.sub(r"[^a-zA-Z0-9_-]", "", sid)[:80]
+    else:
+        sid = ""
+    print(sid)
+except Exception:
+    print("")
+' 2>/dev/null) || session_id=""
 
 MAX_SLEEP="${MAX_SLEEP:-540}"
 WARMUP_THRESHOLD_PCT="${WARMUP_THRESHOLD_PCT:-10}"
 MAX_CACHE_AGE_S="${MAX_CACHE_AGE_S:-300}"
 THROTTLE_LOG="${THROTTLE_LOG:-$HOME/.claude/throttle.log}"
 CACHE_FILE="${CLAUDE_THROTTLE_CACHE:-/tmp/claude-throttle-cache.json}"
+STATS_DIR="${CLAUDE_THROTTLE_STATS_DIR:-/tmp}"
 
 log_msg() {
   local ts
@@ -165,6 +185,34 @@ try:
     print(json.dumps({"systemMessage": d["systemMessage"]}))
 except:
     pass' 2>/dev/null || true
+
+    # Update per-session stats file (best-effort; missing session_id = skip silently)
+    if [[ -n "$session_id" ]]; then
+      stats_file="$STATS_DIR/claude-throttle-stats-$session_id.json"
+      mkdir -p "$STATS_DIR" 2>/dev/null || true
+      python3 - "$stats_file" "$sleep_s" <<'STATS_PY' 2>/dev/null || true
+import json, os, sys, time
+stats_file = sys.argv[1]
+slept = float(sys.argv[2])
+
+try:
+    with open(stats_file) as f:
+        stats = json.load(f)
+    if not isinstance(stats, dict):
+        stats = {}
+except Exception:
+    stats = {}
+
+stats['total_sleep_s'] = float(stats.get('total_sleep_s', 0) or 0) + slept
+stats['throttle_count'] = int(stats.get('throttle_count', 0) or 0) + 1
+stats['last_sleep_at'] = int(time.time())
+
+tmp = stats_file + f'.tmp.{os.getpid()}'
+with open(tmp, 'w') as f:
+    json.dump(stats, f)
+os.replace(tmp, stats_file)
+STATS_PY
+    fi
     ;;
   *)
     log_msg "error: unrecognized pacing output: $result"
