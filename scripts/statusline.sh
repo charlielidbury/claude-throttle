@@ -5,10 +5,12 @@
 # field, and writes it to a cache file that the throttle PreToolUse
 # hook reads.
 #
-# Side-outputs a short status string for the terminal status bar:
-#   "5h:56% 7d:79%"                    — when CLAUDE_THROTTLE not set
-#   "5h:56% 7d:79% | thr:0.9"          — throttle on, no slept-yet
-#   "5h:56% 7d:79% | thr:0.9 [12m/3]"  — throttle on, with stats this session
+# Side-outputs a compact status string for the terminal status bar:
+#   "thr:0.7 | 5h:(56%/80%) 7d:(79%/92%) | session:32m (n=5)"
+# Format per window: "(usage%/window%)" — current utilization /
+# elapsed fraction of the billing window. thr:off when CLAUDE_THROTTLE
+# is unset/zero/non-numeric. The session block appears only when
+# throttling is on and at least one sleep has occurred this session.
 set -u
 
 CACHE_FILE="${CLAUDE_THROTTLE_CACHE:-/tmp/claude-throttle-cache.json}"
@@ -27,36 +29,53 @@ out = {
 print(json.dumps(out))
 " > "$tmp" 2>/dev/null && mv "$tmp" "$CACHE_FILE" || rm -f "$tmp"
 
-# Visible status bar text (rate limits + optional throttle suffix).
+# Visible status bar text.
 echo "$input" | python3 -c '
-import json, os, re, sys
+import json, os, re, sys, time
 
 try:
     d = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
 
+now = time.time()
 rl = d.get("rate_limits") or {}
-fh = (rl.get("five_hour") or {}).get("used_percentage")
-sd = (rl.get("seven_day") or {}).get("used_percentage")
 
-parts = []
-if fh is not None: parts.append(f"5h:{fh:.0f}%")
-if sd is not None: parts.append(f"7d:{sd:.0f}%")
+def window_pcts(key, window_s):
+    w = rl.get(key) or {}
+    used = w.get("used_percentage")
+    resets_at = w.get("resets_at")
+    if not isinstance(used, (int, float)) or not isinstance(resets_at, (int, float)):
+        return None, None
+    remaining = resets_at - now
+    if remaining < 0 or remaining > window_s:
+        elapsed = 0.0
+    else:
+        elapsed = window_s - remaining
+    return used, (elapsed / window_s) * 100.0
 
-segments = []
-if parts:
-    segments.append(" ".join(parts))
+fh_usage, fh_window = window_pcts("five_hour", 18000)
+sd_usage, sd_window = window_pcts("seven_day", 604800)
 
-# Optional throttle suffix
 throttle_str = (os.environ.get("CLAUDE_THROTTLE") or "").strip()
 try:
     thr = float(throttle_str)
 except ValueError:
     thr = 0.0
 
+# thr block
+thr_part = f"thr:{throttle_str}" if thr > 0 else "thr:off"
+
+# windows block (omit windows with no data)
+window_parts = []
+if fh_usage is not None:
+    window_parts.append(f"5h:({fh_usage:.0f}%/{fh_window:.0f}%)")
+if sd_usage is not None:
+    window_parts.append(f"7d:({sd_usage:.0f}%/{sd_window:.0f}%)")
+
+# session stats block (only when throttle on AND at least one sleep)
+session_part = None
 if thr > 0:
-    suffix = f"thr:{throttle_str}"
     sid = d.get("session_id")
     if isinstance(sid, str):
         sid = re.sub(r"[^a-zA-Z0-9_-]", "", sid)[:80]
@@ -79,10 +98,15 @@ if thr > 0:
                     h = int(total // 3600)
                     m = int((total % 3600) // 60)
                     dur = f"{h}h{m}m" if m else f"{h}h"
-                suffix = f"thr:{throttle_str} [{dur}/{count}]"
+                session_part = f"session:{dur} (n={count})"
         except (OSError, ValueError):
             pass
-    segments.append(suffix)
+
+segments = [thr_part]
+if window_parts:
+    segments.append(" ".join(window_parts))
+if session_part:
+    segments.append(session_part)
 
 print(" | ".join(segments))
 '
