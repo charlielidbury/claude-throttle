@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+#
+# Hits the same internal endpoint that powers Claude Code's /usage
+# slash command. Discovered by reverse-engineering the Claude Code
+# binary; the endpoint is not publicly documented.
+#
+# NOT used by the throttle itself — the throttle reads rate-limit
+# data from the statusLine payload instead (officially documented,
+# no reverse engineering). This script is kept around as an ad-hoc
+# debug helper: handy for sanity-checking what the server thinks
+# your utilization is, independent of the cache layer.
+#
+# See docs/rejected-endpoint-approach.md for why we didn't build the
+# throttle on top of this.
 set -euo pipefail
 
 CRED_FILE="${CLAUDE_CREDENTIALS:-$HOME/.claude/.credentials.json}"
