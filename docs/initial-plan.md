@@ -2,84 +2,134 @@
 
 ## Goal
 
-Build a `PreToolUse` hook that paces Claude Code's token consumption against
-elapsed time within the 5-hour billing window, so background agents never
-exhaust the session limit before the window resets.
+Build a `PreToolUse` hook that paces Claude Code's rate-limit utilization
+against elapsed time within the active billing windows (5-hour and
+7-day), so background agents never exhaust the session limit before the
+window resets.
 
 The hook is opt-in per session via an environment variable, so interactive
 sessions in the same project are unaffected.
 
+## Data source
+
+Claude Code's `/usage` slash command queries an internal endpoint that
+returns server-authoritative rate-limit utilization. The throttle hook
+calls the same endpoint:
+
+```
+GET https://api.anthropic.com/api/oauth/usage
+Authorization: Bearer <oauth_access_token>
+anthropic-beta: oauth-2025-04-20
+```
+
+The OAuth access token lives at `~/.claude/.credentials.json` under
+`.claudeAiOauth.accessToken`. Claude Code refreshes it on its own as
+part of normal use; the hook just reads whatever is on disk.
+
+Response shape (relevant fields):
+
+```json
+{
+  "five_hour": {"utilization": 55.0, "resets_at": "2026-04-29T13:20:00+00:00"},
+  "seven_day": {"utilization": 79.0, "resets_at": "2026-04-29T17:00:00+00:00"},
+  "seven_day_opus":   {"utilization": 0.0, "resets_at": null},
+  "seven_day_sonnet": {"utilization": 0.0, "resets_at": null},
+  "extra_usage": {"is_enabled": false, "monthly_limit": null, ...}
+}
+```
+
+`utilization` is a 0–100 percentage of the corresponding window's limit.
+`resets_at` is the ISO 8601 timestamp at which the window rolls over;
+`null` means the window hasn't started accruing yet.
+
+This eliminates the need for `TOKEN_BUDGET` and removes the dependency
+on `ccusage` and JSONL parsing. The number we pace against is the same
+number the user sees in `/usage`.
+
+A small helper script `usage.sh` at the repo root prints this JSON for
+ad-hoc inspection — useful for sanity-checking the throttle.
+
+### Stability caveats
+
+The endpoint is internal and undocumented. Schema or path changes would
+break the hook silently. Mitigations:
+
+- Validate response shape before using it; on schema mismatch, log and
+  fail soft (exit 0, don't block).
+- On HTTP 401 (token expired or revoked), fail soft. Claude Code itself
+  refreshes the token on its next call, so subsequent hook invocations
+  recover automatically.
+- On any network error or non-2xx, fail soft.
+
 ## Pacing model
 
-Claude Code uses 5-hour billing windows. Within a window we want token
-consumption to stay below the chosen fraction of the time-elapsed
-fraction:
+For each tracked window (5-hour, 7-day), define:
 
 ```
-tokens_consumed / token_budget  ≤  CLAUDE_THROTTLE × (elapsed_seconds / 18000)
+window_s        = window length in seconds (18000 for 5h, 604800 for 7d)
+elapsed_s       = window_s − (resets_at − now)
+util_frac       = utilization / 100
+target_elapsed  = util_frac × window_s / CLAUDE_THROTTLE
+sleep_s_window  = max(0, target_elapsed − elapsed_s)
 ```
 
-`CLAUDE_THROTTLE` is a multiplier in (0, 1] that controls how aggressive
-the pacing is. It also serves as the on/off switch — if it's unset (or
-zero), pacing is disabled.
+The hook sleeps for `max(sleep_s_5h, sleep_s_7d)` so whichever window
+is closest to its limit wins. If only one window is reported (e.g.
+`seven_day.resets_at` is null because there's been no recent activity),
+ignore that window.
 
-- `CLAUDE_THROTTLE=1.0` → use up to 100% of the budget evenly across the
-  window. At 50% time elapsed, allow up to 50% of tokens.
-- `CLAUDE_THROTTLE=0.9` → use up to 90% of the budget evenly. At 50%
-  time elapsed, allow up to 45% of tokens. Leaves 10% headroom.
-- `CLAUDE_THROTTLE=0.5` → conservative, half the budget per window.
+`CLAUDE_THROTTLE` is a multiplier in (0, 1] that controls pacing
+aggressiveness. It also serves as the on/off switch — if unset, empty,
+zero, or non-numeric, pacing is disabled.
 
-Define `pace_ratio = (tokens_consumed / token_budget) / (CLAUDE_THROTTLE × elapsed / 18000)`.
+- `CLAUDE_THROTTLE=1.0` → use up to 100% of the limit evenly across the
+  window. At 50% time elapsed, allow utilization up to 50%.
+- `CLAUDE_THROTTLE=0.9` → leave 10% headroom. At 50% time elapsed, allow
+  utilization up to 45%.
+- `CLAUDE_THROTTLE=0.5` → conservative, half the limit per window.
 
-- `pace_ratio < 1.0` → behind pace, run immediately
-- `pace_ratio = 1.0` → on pace
-- `pace_ratio > 1.0` → ahead of pace, sleep before allowing the tool call
+Cap a single sleep at 540 seconds (9 minutes) to stay safely under the
+10-minute hook timeout. If true catchup needs longer, the next tool call
+will sleep again — the agent self-paces over multiple calls.
 
-When ahead of pace, sleep for long enough that pace_ratio returns to ~1.0.
-The required sleep is the time it takes for the scaled elapsed-fraction
-to catch up to the tokens-fraction:
+**Warmup bypass.** For each window, if `utilization < WARMUP_THRESHOLD_PCT`
+(default 10), skip pacing for that window. This avoids:
 
-```
-target_elapsed = (tokens_consumed / token_budget) × 18000 / CLAUDE_THROTTLE
-sleep_seconds  = max(0, target_elapsed - elapsed)
-```
+1. Spurious throttles in the first few minutes of a fresh window where
+   1% utilization at 0.1% elapsed-time looks "ahead of pace" by the math
+   but in practice means nothing.
+2. Division-by-zero / noise when both numbers are near zero.
 
-Cap sleep at 540 seconds (9 minutes) to stay safely under the 10-minute
-hook timeout. If true catchup needs longer, the next tool call will sleep
-again — the agent self-paces over multiple calls.
-
-**Warmup bypass.** If `tokens_consumed / token_budget < 0.10`, never
-throttle — exit 0 immediately regardless of elapsed time. This avoids
-two problems:
-
-1. Division-by-zero or noisy ratios at the very start of a window when
-   both tokens and elapsed are near zero.
-2. Spurious throttles in the first few minutes of a fresh window. A
-   500-token tool call 30 seconds into a window registers as 0.25%
-   tokens / 0.17% time = pace ratio 1.5, which the math says is "ahead"
-   but in practice means nothing — the agent has barely started.
-
-Below 10% of budget the agent is well within any reasonable safety
+Below 10% utilization the agent is well within any reasonable safety
 margin, so pacing has no work to do. Above 10%, normal pacing kicks in.
 
-Worked example: `CLAUDE_THROTTLE=0.9`, `TOKEN_BUDGET=200000`,
-`tokens_consumed=50000`, `elapsed=1800s` (10% of window).
-- Token fraction: 25%, above warmup threshold → normal pacing applies.
-- Target time fraction: 25% / 0.9 = 27.8%.
-- target_elapsed = 0.278 × 18000 = 5004s.
-- sleep_seconds = 5004 - 1800 = 3204s, capped to 540s.
+**Worked example.** `CLAUDE_THROTTLE=0.9`, `five_hour.utilization=55`,
+`resets_at=now+9000s` (so elapsed = 18000−9000 = 9000s, 50% of window).
+
+- Util above 10% threshold → normal pacing.
+- `target_elapsed = 0.55 × 18000 / 0.9 = 11000s`
+- `sleep_s_5h = 11000 − 9000 = 2000s`, capped to 540s.
+
+Same example for the 7-day window with `seven_day.utilization=79`,
+`resets_at=now+50400s` (elapsed = 604800−50400 = 554400s, 91.7% of
+window):
+
+- `target_elapsed = 0.79 × 604800 / 0.9 = 530773s`
+- `sleep_s_7d = 530773 − 554400 = −23627s` → 0 (already behind pace on 7d).
+
+Final sleep = `max(540, 0) = 540s`. Hook sleeps for 9 minutes, emits
+the systemMessage, and exits 0.
 
 ## Activation
 
 The hook only paces when `CLAUDE_THROTTLE` is set to a positive number.
 If unset, empty, zero, or non-numeric, the hook exits 0 immediately
-(no-op). The numeric value is the budget-fraction multiplier described
-above.
+(no-op).
 
 Background-agent launch:
 
 ```bash
-CLAUDE_THROTTLE=0.9 TOKEN_BUDGET=200000 claude
+CLAUDE_THROTTLE=0.9 claude
 ```
 
 Interactive launch (no env var, hook is a no-op):
@@ -98,7 +148,7 @@ git repo. Users install with:
 /plugin install throttle@claude-throttle
 ```
 
-(Repo name and plugin name are placeholders — fill in the real ones.)
+(Repo and plugin names are placeholders — fill in the real ones.)
 
 Plugins live in Claude Code's cache directory after install
 (`~/.claude/plugins/cache/...`) and update via `/plugin marketplace update`.
@@ -128,6 +178,7 @@ claude-throttle/                          # repo root = marketplace
 │       │   ├── test-throttle.sh          # unit tests
 │       │   └── integration-test.sh       # integration test
 │       └── README.md
+├── usage.sh                              # ad-hoc usage probe
 └── README.md                             # repo-level readme for GitHub
 ```
 
@@ -138,43 +189,48 @@ claude-throttle/                          # repo root = marketplace
 Responsibilities:
 
 - Exit 0 immediately if `CLAUDE_THROTTLE` is unset, empty, zero, or
-  non-numeric (treat any of these as "throttling disabled").
-- Read current 5-hour block state from `ccusage blocks --json`.
-- If `tokens_consumed / token_budget < WARMUP_THRESHOLD` (default 0.10),
-  exit 0 without throttling — the agent has barely started, no pacing
-  needed. Log this decision so it's visible in the throttle log.
-- Otherwise, compute pace ratio and required sleep using the multiplier.
-- Sleep (capped at 540s), then exit 0.
-- Log every decision to `~/.claude/throttle.log` for inspection.
+  non-numeric.
+- Read OAuth access token from `~/.claude/.credentials.json`.
+- `GET /api/oauth/usage` with the Bearer token and beta header.
+- Validate response shape; on any failure (network, non-2xx, schema),
+  log and exit 0.
+- For each tracked window (`five_hour`, `seven_day`):
+  - If utilization < `WARMUP_THRESHOLD_PCT` (default 10), skip.
+  - Else compute `sleep_s_window` per the pacing model.
+- Sleep for `max(sleep_s_5h, sleep_s_7d)`, capped at `MAX_SLEEP` (default 540).
+- Log every decision to `~/.claude/throttle.log`.
 - After a non-zero sleep, emit a JSON object to stdout with a
-  `systemMessage` field summarizing the throttle (see "User notification"
-  below). Skip emission when `sleep_seconds == 0` to avoid transcript noise.
-- On any error (ccusage missing, JSON parse fail, etc.), log and exit 0
-  — never block the agent due to hook failure.
+  `systemMessage` field summarizing the throttle (see below). Skip
+  emission when `sleep_s == 0` to avoid transcript noise.
+- On any error (no token, network failure, JSON parse fail, etc.), log
+  and exit 0 — never block the agent due to hook failure.
+
+Cache layer: store the most recent `/usage` response at
+`/tmp/claude-throttle-cache.json` with a `CACHE_TTL_S` (default 30)
+expiry. Utilization moves slowly enough that 30s staleness is
+indistinguishable from live, and this avoids hammering the endpoint on
+tool-heavy turns.
 
 Inputs:
-- stdin: PreToolUse JSON event from Claude Code (not actually needed for
-  the pacing decision, but read and discarded so the hook is a clean
-  command-type hook).
-- env `CLAUDE_THROTTLE`: budget-fraction multiplier in (0, 1]. Unset,
-  empty, zero, or non-numeric disables the hook. Values >1 are accepted
-  but unusual (would let the agent burn through budget faster than
-  evenly-paced — defeats the point but isn't an error).
-- env `TOKEN_BUDGET`: per-window token budget (default 200_000).
-- env `WINDOW_SECONDS`: window length (default 18000 = 5h).
+- stdin: PreToolUse JSON event from Claude Code (read and discarded).
+- env `CLAUDE_THROTTLE`: pacing multiplier in (0, 1]. Unset, empty,
+  zero, or non-numeric disables the hook.
 - env `MAX_SLEEP`: cap on a single sleep (default 540).
-- env `WARMUP_THRESHOLD`: token-fraction below which throttling is
-  bypassed (default 0.10). Set to 0 to disable the warmup bypass.
+- env `WARMUP_THRESHOLD_PCT`: utilization percent below which pacing is
+  bypassed for a given window (default 10). Set to 0 to disable.
+- env `CACHE_TTL_S`: cache lifetime for the `/usage` response (default 30).
 - env `THROTTLE_LOG`: log file path (default `~/.claude/throttle.log`).
+- env `CLAUDE_CREDENTIALS`: path to credentials file (default
+  `~/.claude/.credentials.json`).
 
 User notification:
 
-After sleeping (only when `sleep_seconds > 0`), the hook emits a JSON
-object on stdout:
+After sleeping (only when `sleep_s > 0`), the hook emits a JSON object
+on stdout:
 
 ```json
 {
-  "systemMessage": "Throttle: slept 240s (pace 1.34, tokens 67k/110k, elapsed 28% of window, throttle=0.9)"
+  "systemMessage": "Throttle: slept 540s (5h: 55% util at 50% elapsed; 7d: 79% util at 92% elapsed; throttle=0.9)"
 }
 ```
 
@@ -196,6 +252,12 @@ an actual sleep. Any other stdout content on a `PreToolUse` hook is
 parsed as JSON output and could confuse Claude Code if malformed. All
 debug logging goes to the log file or stderr, never stdout.
 
+Verify before relying on it: confirm `systemMessage` is the right output
+field for `PreToolUse` hooks against the installed Claude Code version
+(`/hooks` and `claude --debug`). If not supported on PreToolUse, fall
+back to writing the notice to stderr (Claude Code surfaces hook stderr
+as a transcript notice).
+
 ### 2. Plugin manifest: `.claude-plugin/plugin.json`
 
 Standard plugin metadata:
@@ -204,7 +266,7 @@ Standard plugin metadata:
 {
   "name": "throttle",
   "version": "0.1.0",
-  "description": "Pace Claude Code token consumption against elapsed time within the 5-hour billing window",
+  "description": "Pace Claude Code rate-limit utilization against elapsed time within billing windows",
   "author": "your-name",
   "homepage": "https://github.com/your-user/claude-throttle"
 }
@@ -218,7 +280,7 @@ Top-level catalog so the repo can be added with `/plugin marketplace add`:
 {
   "name": "claude-throttle",
   "owner": "your-name",
-  "description": "Token-pacing throttle for Claude Code background agents",
+  "description": "Rate-limit-aware throttle for Claude Code background agents",
   "plugins": [
     {
       "name": "throttle",
@@ -266,30 +328,30 @@ Code. See Test plan below.
    - Create the directory structure shown under "Distribution".
    - Initialise git, push to GitHub. Repo can be public from day one.
 
-2. **Verify ccusage is installed and works.**
-   - `which ccusage` returns a path.
-   - `ccusage blocks --json` returns valid JSON with at least one block.
-   - If absent, install: `npm install -g ccusage`.
-   - Document this as a prerequisite in the README. The hook will check
-     at runtime and fail soft (log + exit 0) if missing.
+2. **Verify prerequisites.**
+   - `curl` and `python3` (or `jq`) for HTTP and JSON parsing.
+   - `~/.claude/.credentials.json` exists and contains
+     `claudeAiOauth.accessToken` (true for any user logged in via
+     Claude Pro/Max).
+   - Document these in the README.
 
 3. **Write `scripts/throttle.sh`.**
    - Bash, `set -euo pipefail` at the top, but trap errors to log-and-exit-0.
-   - Use `jq` to parse ccusage output. Verify `jq` is installed.
-   - Identify the active block from the JSON (the one with `isActive: true`
-     or matching status — confirm field name by inspecting actual ccusage
-     output before coding against it).
-   - Extract `totalTokens` and `startTime` from the active block.
-   - Compute elapsed seconds: `now_epoch - start_epoch`.
-   - Check warmup bypass: if `tokens / budget < WARMUP_THRESHOLD`, log
-     and exit 0 without further computation.
-   - Compute `target_elapsed` and `sleep_seconds` as in the pacing model.
-   - Cap and sleep.
-   - Always log: timestamp, tokens, elapsed, pace_ratio, sleep_decision
-     (and warmup-bypass status when applicable).
-   - If a sleep occurred, emit the `systemMessage` JSON object to stdout
-     after the sleep completes. Use `jq -n` or `printf` with proper
-     escaping; do not hand-build JSON strings.
+   - Read access token from credentials file (path overridable via env).
+   - `GET /api/oauth/usage`. Check HTTP status, parse JSON, validate
+     shape (presence of `five_hour` / `seven_day` objects with numeric
+     `utilization` and ISO `resets_at` or null).
+   - Implement TTL cache at `/tmp/claude-throttle-cache.json`.
+   - For each window, compute `elapsed_s` from `resets_at`. Skip windows
+     where `resets_at` is null.
+   - Apply warmup bypass per window.
+   - Compute `sleep_s_window` per the pacing model. Take max across
+     windows. Cap at `MAX_SLEEP`.
+   - Sleep, then emit `systemMessage` JSON if sleep was non-zero.
+   - Always log: timestamp, utilization (5h, 7d), elapsed (5h, 7d),
+     sleep decision, warmup-bypass status.
+   - Use `python3 -c` for any float math and JSON construction; do not
+     hand-build JSON strings.
 
 4. **Write the manifests** (`plugin.json`, `marketplace.json`, `hooks.json`)
    per the templates in Components above.
@@ -303,14 +365,14 @@ Code. See Test plan below.
 
 7. **Smoke test in a real session.**
    - With the plugin loaded via `--plugin-dir`, launch with
-     `CLAUDE_THROTTLE=0.5 TOKEN_BUDGET=10000 claude --plugin-dir ./plugins/throttle`
-     (low multiplier and small budget so pacing kicks in fast).
+     `CLAUDE_THROTTLE=0.5 claude --plugin-dir ./plugins/throttle` (low
+     multiplier so pacing kicks in fast given current real utilization).
    - Run a few tool calls.
    - Tail `~/.claude/throttle.log` and verify sleeps are happening.
    - Launch without `CLAUDE_THROTTLE` set, verify zero pacing overhead
      (no log entries, no sleeps).
-   - Launch with `CLAUDE_THROTTLE=1.0 TOKEN_BUDGET=10000` and confirm
-     less-aggressive throttling than the 0.5 run.
+   - Launch with `CLAUDE_THROTTLE=1.0` and confirm less-aggressive
+     throttling than the 0.5 run.
 
 8. **Publish to marketplace.**
    - Push the repo to GitHub.
@@ -321,29 +383,35 @@ Code. See Test plan below.
 
 ### Unit tests for `throttle.sh`
 
-The test harness should mock `ccusage` by replacing it with a function
-that emits canned JSON. Test cases:
+The test harness should mock the `/usage` endpoint by replacing `curl`
+(or an intermediate fetch function) with a stub that emits canned JSON.
+Test cases:
 
 | Case | Setup | Expected |
 |------|-------|----------|
-| Throttle disabled (unset) | `CLAUDE_THROTTLE` unset | Exit 0, no sleep, no ccusage call, no stdout |
-| Throttle disabled (empty) | `CLAUDE_THROTTLE=""` | Exit 0, no sleep, no ccusage call, no stdout |
-| Throttle disabled (zero) | `CLAUDE_THROTTLE=0` | Exit 0, no sleep, no ccusage call, no stdout |
-| Throttle disabled (garbage) | `CLAUDE_THROTTLE=foo` | Exit 0, no sleep, no ccusage call, no stdout |
-| Warmup bypass | tokens=5000, budget=200000 (2.5%), elapsed=0s | Exit 0, no sleep, log shows "warmup bypass", no stdout |
-| Warmup bypass even when ahead | tokens=15000, budget=200000 (7.5%), elapsed=60s, throttle=0.5 | Without bypass would sleep; with bypass exits 0 cleanly |
-| Just over warmup | tokens=21000, budget=200000 (10.5%), elapsed=900s | Normal pacing applies, computes pace ratio |
-| Custom warmup threshold | `WARMUP_THRESHOLD=0`, tokens=1, budget=200000, elapsed=0s | Bypass disabled; should not crash on near-zero division |
-| Behind pace, throttle=1.0 | tokens=50000, budget=200000 (25%), elapsed=9000s (50% time) | Exit 0, sleep_seconds=0, no stdout |
-| On pace, throttle=1.0 | tokens=40000, budget=200000 (20%), elapsed=3600s (20% time) | Exit 0, sleep ≈ 0, no stdout |
-| Ahead of pace, throttle=1.0 | tokens=40000, budget=200000 (20%), elapsed=1800s (10% time) | Sleep > 0 capped at 540, stdout JSON with `systemMessage` |
-| Multiplier kicks in early, throttle=0.5 | tokens=40000, budget=200000 (20%), elapsed=3600s (20% time) | At throttle=1.0 this is on-pace; at 0.5 it's ahead — sleep > 0 |
-| Multiplier strict, throttle=0.9 (boundary) | tokens=45000, budget=200000 (22.5%), elapsed=9000s (50% time) | At threshold — sleep ≈ 0 (within 0.9 budget) |
-| Multiplier strict, throttle=0.9 (over) | tokens=46000, budget=200000 (23%), elapsed=9000s (50% time) | Sleep > 0 (just over the 22.5% threshold) |
-| ccusage missing | mock `which ccusage` to fail | Log error, exit 0 (don't block), no stdout |
-| ccusage returns no active block | empty blocks array | Log warning, exit 0, no stdout |
-| Invalid JSON from ccusage | mock returns garbage | Log error, exit 0, no stdout |
-| Zero tokens consumed | tokens=0, elapsed=anything | Warmup bypass triggers, exit 0, no sleep |
+| Throttle disabled (unset) | `CLAUDE_THROTTLE` unset | Exit 0, no sleep, no fetch, no stdout |
+| Throttle disabled (empty) | `CLAUDE_THROTTLE=""` | Exit 0, no sleep, no fetch, no stdout |
+| Throttle disabled (zero) | `CLAUDE_THROTTLE=0` | Exit 0, no sleep, no fetch, no stdout |
+| Throttle disabled (garbage) | `CLAUDE_THROTTLE=foo` | Exit 0, no sleep, no fetch, no stdout |
+| Warmup bypass, 5h | `five_hour.utilization=5`, elapsed=0s | Exit 0, no sleep on 5h, log shows "warmup bypass" |
+| Warmup bypass, 7d | `seven_day.utilization=5`, elapsed=anything | Exit 0, no sleep on 7d |
+| Warmup bypass even when ahead | `five_hour.utilization=7.5`, elapsed=60s, throttle=0.5 | Without bypass would sleep; with bypass exits 0 |
+| Just over warmup | `five_hour.utilization=10.5`, elapsed=900s | Normal pacing applies |
+| Custom warmup threshold | `WARMUP_THRESHOLD_PCT=0`, util=0.001, elapsed=0s | Bypass disabled; should not crash on near-zero division |
+| Behind pace, throttle=1.0 | util=25, elapsed=9000s (50% of 5h) | Exit 0, sleep=0, no stdout |
+| On pace, throttle=1.0 | util=20, elapsed=3600s (20% of 5h) | Sleep ≈ 0 |
+| Ahead of pace, throttle=1.0 | util=20, elapsed=1800s (10% of 5h) | Sleep > 0, capped at 540, stdout JSON |
+| Multiplier kicks in early, throttle=0.5 | util=20, elapsed=3600s | At 1.0 this is on-pace; at 0.5 it's ahead — sleep > 0 |
+| Both windows ahead | 5h ahead by 100s, 7d ahead by 300s | Sleep = 300 (max of the two) |
+| 7d resets_at null | `seven_day.resets_at = null` | 7d ignored; sleep based on 5h only |
+| HTTP 401 | mock returns 401 | Log error, exit 0, no stdout |
+| HTTP 5xx | mock returns 500 | Log error, exit 0, no stdout |
+| Network failure | curl exits non-zero | Log error, exit 0, no stdout |
+| Invalid JSON | mock returns garbage | Log error, exit 0, no stdout |
+| Missing fields | response without `five_hour` | Log error, exit 0, no stdout |
+| Cache hit | cache file < TTL old | No fetch, decision derived from cache |
+| Cache miss (expired) | cache file > TTL old | Fetch, update cache |
+| No credentials file | unset/missing creds path | Log error, exit 0, no stdout |
 | Stdout JSON validity | any case that produces stdout | Output parses as valid JSON; `systemMessage` is a non-empty string |
 
 For sleep verification, override the `sleep` builtin in the test (e.g.
@@ -351,14 +419,15 @@ For sleep verification, override the `sleep` builtin in the test (e.g.
 intended sleep duration.
 
 For stdout verification, capture stdout separately from stderr and pipe
-through `jq -e .` to confirm valid JSON when expected, or assert empty
-when not expected.
+through `python3 -m json.tool` (or `jq -e .`) to confirm valid JSON
+when expected, or assert empty when not expected.
 
 ### Integration test
 
 A second harness script that:
 1. Launches `claude -p "run ls then date then pwd" --dangerously-skip-permissions`
-   with `CLAUDE_THROTTLE=0.5 TOKEN_BUDGET=500` (low multiplier, tiny budget).
+   with `CLAUDE_THROTTLE=0.1` (low multiplier so even normal utilization
+   triggers a sleep).
 2. Times the run.
 3. Verifies `~/.claude/throttle.log` shows sleeps between tool calls.
 4. Verifies the `claude -p` stdout contains throttle warning notices
@@ -370,29 +439,38 @@ A second harness script that:
 
 - `/hooks` inside Claude Code shows the throttle hook registered.
 - `claude --debug` output mentions the hook firing on tool calls.
+- `./usage.sh` returns the same JSON the hook is reading.
 - Stderr from the hook (if any) appears as a `<hook name> hook error`
-  notice in the transcript — this should never happen in normal operation.
+  notice in the transcript — should never happen in normal operation.
 
 ## Edge cases and gotchas
 
-- **No active block.** If ccusage shows no active 5-hour block (cold
-  start, no recent activity), there's nothing to pace against. Exit 0.
-- **Block boundary.** When the active block rolls over to a new window,
-  `tokens_consumed` resets and `elapsed` resets. The pacing math still
-  works without special handling.
-- **Multiple concurrent sessions.** ccusage aggregates across all sessions
-  in the active block. If two background agents both run with the hook,
-  they'll pace against the shared total — which is what we want.
-- **Hook timeout.** If the hook is killed at the 600s timeout, Claude Code
-  treats it as a non-blocking error and the tool call proceeds. This is
-  acceptable failure mode (worst case: one un-paced tool call).
-- **Don't log to stdout.** PreToolUse stdout is parsed as JSON output; any
-  non-JSON stdout could confuse Claude Code. Log to a file or stderr.
+- **resets_at is null.** Window hasn't accrued usage yet (e.g. cold
+  start). Skip that window.
+- **resets_at in the past.** Clock skew or a stale cached response. Treat
+  as zero elapsed (fresh window).
+- **Window boundary.** When the active window rolls over, `utilization`
+  resets and `resets_at` advances. The pacing math still works without
+  special handling.
+- **Multiple concurrent sessions / agents.** The endpoint reports a
+  global utilization for the account. Multiple background agents pacing
+  off the same number is exactly the behavior we want.
+- **Parallel tool calls in a single session.** N parallel tool calls fire
+  N hook invocations; each reads the same cached utilization and decides
+  to sleep concurrently. Wall time is the longest sleep, not the sum.
+  Acceptable.
+- **Hook timeout.** If the hook is killed at the 600s timeout, Claude
+  Code treats it as a non-blocking error and the tool call proceeds.
+  Acceptable failure mode (worst case: one un-paced tool call).
+- **Token expired.** Hook 401s, fails soft. Next `claude` invocation
+  refreshes the token; subsequent hook invocations recover.
+- **Don't log to stdout.** PreToolUse stdout is parsed as JSON output;
+  any non-JSON stdout could confuse Claude Code. Log to a file or stderr.
 - **`set -e` and arithmetic.** Bash `(( ... ))` returning 0 with `set -e`
   exits the script. Use `|| true` or `if (( ... )); then`.
-- **ccusage JSON schema.** Confirm field names (`isActive`, `totalTokens`,
-  `startTime`) match the installed version before hardcoding. Run
-  `ccusage blocks --json | jq .` once and adjust.
+- **Endpoint stability.** Internal/undocumented. If the path or schema
+  changes, validate-and-fail-soft means the hook turns into a no-op
+  rather than blocking the agent. Log loudly so the user notices.
 
 ## Deliverables
 
@@ -406,84 +484,58 @@ containing:
 5. `plugins/throttle/tests/test-throttle.sh` — unit test harness.
 6. `plugins/throttle/tests/integration-test.sh` — integration test harness.
 7. `plugins/throttle/README.md` — plugin README documenting:
-   - Prerequisites: `jq`, `ccusage` (link to install), `bc`.
+   - Prerequisites: `curl`, `python3` (for JSON parsing and float math).
    - How to install: `/plugin marketplace add user/claude-throttle`
      then `/plugin install throttle@claude-throttle`.
    - How to enable: `export CLAUDE_THROTTLE=0.9` (or any value in (0, 1])
      before `claude`. Lower values are more conservative.
    - Recommended starting values: `0.9` for normal background use,
      `0.5` for very conservative pacing, `1.0` for even-pacing only.
-   - How to tune: `TOKEN_BUDGET`, `WINDOW_SECONDS`, `MAX_SLEEP`,
-     `WARMUP_THRESHOLD`.
+   - How to tune: `MAX_SLEEP`, `WARMUP_THRESHOLD_PCT`, `CACHE_TTL_S`.
    - Where logs go.
    - How to disable temporarily: `unset CLAUDE_THROTTLE` (or set it to
      `0`, empty, or any non-numeric value).
    - How to uninstall: `/plugin uninstall throttle@claude-throttle`.
-8. `README.md` at repo root — short overview, links to plugin docs,
+8. `usage.sh` — repo-root helper that prints raw `/usage` JSON.
+9. `README.md` at repo root — short overview, links to plugin docs,
    install instructions for the marketplace.
 
 ## Open questions
 
-These are decisions to make based on real-world experimentation rather
-than upfront design. Resolve before v1 ships.
+### Q1: Endpoint stability commitment
 
-### Q1: Source of token-consumption data
+The `/api/oauth/usage` endpoint is the same one `/usage` calls
+internally. It works today but is undocumented. For internal/personal
+use this is fine; for a public marketplace plugin, worth a conversation
+with whoever owns the surface about: (a) stability expectations, (b)
+whether a documented public equivalent (or a `claude --usage` flag, see
+GH#20399) is on the roadmap, (c) preferred user-agent / identification
+so traffic from the plugin is distinguishable from `/usage` traffic.
 
-The hook needs to know how many tokens have been used in the current
-5-hour window. Options:
+If a documented surface ships, switch to it. Until then, validate-and-
+fail-soft on schema mismatch is the safety net.
 
-- **ccusage CLI** (current plan). Mature, handles window-boundary logic
-  correctly. Performance: ~190ms minimum (Node.js startup), scales with
-  total JSONL size — measured ~250ms for light users, ~830ms for ~6 MB
-  of session data, ~2.3s for ~25 MB. Mitigations: cache result for ~10s
-  in `/tmp`, use `--since` to limit scanned data. Hard dependency on
-  Node.js runtime.
-- **Direct JSONL parsing** with bash + jq. Read
-  `~/.claude/projects/*/*.jsonl` directly, sum `usage.*` fields from
-  assistant messages in the last 5 hours. Avoids Node.js startup
-  entirely; expected ~50-100ms. Have to re-implement window-boundary
-  logic, which is the bulk of ccusage's actual value. Risk: JSONL
-  format is not a stable API (issue #41591 saw auto-updates change it).
-- **tmux + `/usage` scraper on a cron.** Spawn detached `claude` session
-  every N minutes, send `/usage`, capture pane buffer, parse percentages,
-  write to file. Throttle hook reads the file (near-instant). Only path
-  to authoritative numbers. Costs: tokens consumed by polling sessions
-  (a few hundred per poll, adds up), risk of triggering new 5-hour
-  windows just by monitoring, fragile TUI parsing, coarse granularity.
-- **Reverse-engineered API endpoint.** `/usage` clearly hits something
-  server-side. Capturable via `claude --debug` or mitmproxy. Most
-  accurate, instant. Costs: depends on internal OAuth token format and
-  undocumented endpoint, both can change without warning; gray-area
-  TOS-wise; not a stable foundation for a public tool.
-- **Wait for `claude --usage` flag.** Open feature request (#20399). If
-  it ships, becomes the obviously-correct option.
+### Q2: Cache strategy
 
-Recommendation: ccusage with caching + `--since` for v1. Re-evaluate
-once real-world performance numbers are in. Custom JSONL parser as a
-v2 enhancement if ccusage proves too slow. Reverse-engineered endpoint
-is interesting for personal use but probably not for a public tool.
+Whether 30s TTL is the right default.
 
-### Q2: Cache layer
+- **Lower (e.g. 5s)** — fresher data, but on tool-heavy turns the hook
+  could fire several times per second. Mostly redundant.
+- **Higher (e.g. 60-120s)** — fewer requests, but a burst inside a
+  cache window could push utilization meaningfully past target before
+  the hook notices.
 
-Whether to cache ccusage output between calls.
+Recommendation: 30s default, configurable via `CACHE_TTL_S`. Revisit
+once we have real-world throughput numbers.
 
-- **No cache.** Simplest. Every `PreToolUse` invocation re-runs
-  ccusage. Adds 200ms-2s per tool call.
-- **TTL cache** (e.g. `/tmp/throttle-cache.json` with 10s expiry).
-  Big speedup on tool-heavy workflows. Slightly stale data, which is
-  fine because pacing math doesn't need second-level precision.
-- **Filesystem-mtime cache.** Re-run ccusage only when JSONL files in
-  `~/.claude/projects/` have changed since last cached read. More
-  accurate than TTL, slightly more code.
+## Out of scope for v1
 
-Recommendation: TTL cache (10s default, configurable via env var) for
-v1. Measure whether mtime cache is worth the extra complexity later.
-
-
-
-- Multi-window pacing (weekly limits). The 5-hour window is the binding
-  constraint; weekly is a separate problem.
+- Pacing per-model windows (`seven_day_opus`, `seven_day_sonnet`)
+  separately. v1 paces against the aggregate `five_hour` and
+  `seven_day` only. Per-model can come later if needed.
 - Auto-resume after window exhaustion. That's `claude-auto-retry`'s job.
-- Per-agent budgets when multiple background agents share a window. v1
-  paces against the global ccusage total; per-agent allocation can come
-  later if needed.
+- Per-agent budgets when multiple background agents share an account.
+  v1 paces against the global utilization total; per-agent allocation
+  can come later if needed.
+- Pacing against `extra_usage` (paid overage credits). Not relevant for
+  the limit-avoidance use case.
