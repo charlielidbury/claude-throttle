@@ -1,82 +1,115 @@
-# Claude Code Token-Pacing Throttle Hook — Build Plan
+# Claude Code Token-Pacing Throttle — Build Plan
 
 ## Goal
 
-Build a `PreToolUse` hook that paces Claude Code's rate-limit utilization
-against elapsed time within the active billing windows (5-hour and
-7-day), so background agents never exhaust the session limit before the
+Pace Claude Code's rate-limit utilization against elapsed time within
+the active billing windows (5-hour and 7-day), so background agents
+running in interactive mode never exhaust the session limit before the
 window resets.
 
-The hook is opt-in per session via an environment variable, so interactive
-sessions in the same project are unaffected.
+The throttle is opt-in per session via an environment variable, so
+interactive sessions in the same project are unaffected when it's not
+set.
 
-## Data source
+## Architecture
 
-Claude Code's `/usage` slash command queries an internal endpoint that
-returns server-authoritative rate-limit utilization. The throttle hook
-calls the same endpoint:
+Two scripts and a cache file:
 
 ```
-GET https://api.anthropic.com/api/oauth/usage
-Authorization: Bearer <oauth_access_token>
-anthropic-beta: oauth-2025-04-20
+┌────────────────────┐   writes    ┌────────────────────────┐
+│  statusline.sh     │ ──────────▶ │ /tmp/claude-throttle-  │
+│  (statusLine cmd)  │             │ cache.json             │
+│                    │             └────────────────────────┘
+│  reads rate_limits │                        │
+│  from stdin        │                        │ reads
+│  prints status bar │                        ▼
+│  text              │             ┌────────────────────────┐
+└────────────────────┘             │  throttle.sh           │
+                                   │  (PreToolUse hook)     │
+                                   │  decides: sleep/skip   │
+                                   └────────────────────────┘
 ```
 
-The OAuth access token lives at `~/.claude/.credentials.json` under
-`.claudeAiOauth.accessToken`. Claude Code refreshes it on its own as
-part of normal use; the hook just reads whatever is on disk.
+- **`statusline.sh`** is registered as the user's `statusLine` command.
+  Claude Code pipes its statusLine JSON (including `rate_limits`) to
+  this script on every tick. The script writes the relevant subset
+  atomically to a cache file, and prints a short visible status bar
+  string ("5h:56% 7d:79%").
+- **`throttle.sh`** is registered as a `PreToolUse` hook with matcher
+  `*`. On every tool call, it reads the cache file, computes whether
+  pacing is needed, sleeps if so, and exits 0.
 
-Response shape (relevant fields):
+This split is necessary because PreToolUse hooks do not receive
+`rate_limits` in their stdin. We confirmed empirically: PreToolUse
+stdin contains only `session_id`, `transcript_path`, `cwd`,
+`permission_mode`, `hook_event_name`, `tool_name`, `tool_input`,
+`tool_use_id`. The `rate_limits` field is exposed only via statusLine
+input.
+
+## Data source: statusLine `rate_limits`
+
+Claude Code v1.2.80+ pipes `rate_limits` to statusLine commands as
+part of the standard payload:
 
 ```json
 {
-  "five_hour": {"utilization": 55.0, "resets_at": "2026-04-29T13:20:00+00:00"},
-  "seven_day": {"utilization": 79.0, "resets_at": "2026-04-29T17:00:00+00:00"},
-  "seven_day_opus":   {"utilization": 0.0, "resets_at": null},
-  "seven_day_sonnet": {"utilization": 0.0, "resets_at": null},
-  "extra_usage": {"is_enabled": false, "monthly_limit": null, ...}
+  "rate_limits": {
+    "five_hour":  {"used_percentage": 56, "resets_at": 1777468800},
+    "seven_day":  {"used_percentage": 79, "resets_at": 1777482000}
+  }
 }
 ```
 
-`utilization` is a 0–100 percentage of the corresponding window's limit.
-`resets_at` is the ISO 8601 timestamp at which the window rolls over;
-`null` means the window hasn't started accruing yet.
+- `used_percentage` is 0–100, the same number `/usage` shows.
+- `resets_at` is a Unix epoch timestamp (seconds).
+- Field is documented at <https://code.claude.com/docs/en/statusline>.
+- Verified empirically: the numbers match
+  `https://api.anthropic.com/api/oauth/usage` (the endpoint `/usage`
+  itself queries) within sampling drift.
 
-This eliminates the need for `TOKEN_BUDGET` and removes the dependency
-on `ccusage` and JSONL parsing. The number we pace against is the same
-number the user sees in `/usage`.
+### Cold start and staleness
 
-A small helper script `usage.sh` at the repo root prints this JSON for
-ad-hoc inspection — useful for sanity-checking the throttle.
+Two facts about statusLine cadence we have to design around:
 
-### Stability caveats
+1. **`rate_limits` only appears after the first API response of a
+   session.** First statusLine tick has no `rate_limits` field
+   (verified). The throttle hook treats missing data as "no signal,
+   skip pacing".
 
-The endpoint is internal and undocumented. Schema or path changes would
-break the hook silently. Mitigations:
+2. **statusLine ticks fire on assistant-message updates, not on a
+   timer.** During a tool-heavy turn (many bash/read/edit tool calls
+   between assistant messages), the cache could be 10–60s stale.
+   Utilization moves slowly enough that this is acceptable for pacing
+   purposes — within a single tool-heavy turn the utilization rarely
+   moves more than 1–2 percentage points.
 
-- Validate response shape before using it; on schema mismatch, log and
-  fail soft (exit 0, don't block).
-- On HTTP 401 (token expired or revoked), fail soft. Claude Code itself
-  refreshes the token on its next call, so subsequent hook invocations
-  recover automatically.
-- On any network error or non-2xx, fail soft.
+The hook treats cache older than `MAX_CACHE_AGE_S` (default 300s) as
+missing — stale enough that it's better to fail open than pace on
+old data.
+
+### Why not the `/api/oauth/usage` endpoint?
+
+Considered and rejected — see `docs/rejected-endpoint-approach.md`.
+Short version: undocumented internal endpoint, OAuth handling, slower
+per call, and statusLine already gives us the same number. The
+endpoint helper script `usage.sh` is preserved as an ad-hoc debug
+tool.
 
 ## Pacing model
 
-For each tracked window (5-hour, 7-day), define:
+For each tracked window (`five_hour`, `seven_day`), define:
 
 ```
 window_s        = window length in seconds (18000 for 5h, 604800 for 7d)
 elapsed_s       = window_s − (resets_at − now)
-util_frac       = utilization / 100
+util_frac       = used_percentage / 100
 target_elapsed  = util_frac × window_s / CLAUDE_THROTTLE
 sleep_s_window  = max(0, target_elapsed − elapsed_s)
 ```
 
 The hook sleeps for `max(sleep_s_5h, sleep_s_7d)` so whichever window
-is closest to its limit wins. If only one window is reported (e.g.
-`seven_day.resets_at` is null because there's been no recent activity),
-ignore that window.
+is closest to its limit wins. If only one window is reported, ignore
+the other.
 
 `CLAUDE_THROTTLE` is a multiplier in (0, 1] that controls pacing
 aggressiveness. It also serves as the on/off switch — if unset, empty,
@@ -84,38 +117,34 @@ zero, or non-numeric, pacing is disabled.
 
 - `CLAUDE_THROTTLE=1.0` → use up to 100% of the limit evenly across the
   window. At 50% time elapsed, allow utilization up to 50%.
-- `CLAUDE_THROTTLE=0.9` → leave 10% headroom. At 50% time elapsed, allow
-  utilization up to 45%.
+- `CLAUDE_THROTTLE=0.9` → leave 10% headroom. At 50% time elapsed,
+  allow utilization up to 45%.
 - `CLAUDE_THROTTLE=0.5` → conservative, half the limit per window.
 
 Cap a single sleep at 540 seconds (9 minutes) to stay safely under the
-10-minute hook timeout. If true catchup needs longer, the next tool call
-will sleep again — the agent self-paces over multiple calls.
+10-minute hook timeout. If true catchup needs longer, the next tool
+call will sleep again — the agent self-paces over multiple calls.
 
-**Warmup bypass.** For each window, if `utilization < WARMUP_THRESHOLD_PCT`
-(default 10), skip pacing for that window. This avoids:
+**Warmup bypass.** For each window, if `used_percentage <
+WARMUP_THRESHOLD_PCT` (default 10), skip pacing for that window. Below
+10% utilization the agent is well within any reasonable safety margin,
+so pacing has no work to do. Avoids spurious throttles in the first
+few minutes of a fresh window where the math says "ahead of pace" but
+in practice means nothing.
 
-1. Spurious throttles in the first few minutes of a fresh window where
-   1% utilization at 0.1% elapsed-time looks "ahead of pace" by the math
-   but in practice means nothing.
-2. Division-by-zero / noise when both numbers are near zero.
-
-Below 10% utilization the agent is well within any reasonable safety
-margin, so pacing has no work to do. Above 10%, normal pacing kicks in.
-
-**Worked example.** `CLAUDE_THROTTLE=0.9`, `five_hour.utilization=55`,
+**Worked example.** `CLAUDE_THROTTLE=0.9`, `five_hour.used_percentage=56`,
 `resets_at=now+9000s` (so elapsed = 18000−9000 = 9000s, 50% of window).
 
 - Util above 10% threshold → normal pacing.
-- `target_elapsed = 0.55 × 18000 / 0.9 = 11000s`
-- `sleep_s_5h = 11000 − 9000 = 2000s`, capped to 540s.
+- `target_elapsed = 0.56 × 18000 / 0.9 = 11200s`
+- `sleep_s_5h = 11200 − 9000 = 2200s`, capped to 540s.
 
-Same example for the 7-day window with `seven_day.utilization=79`,
+Same example with `seven_day.used_percentage=79`,
 `resets_at=now+50400s` (elapsed = 604800−50400 = 554400s, 91.7% of
 window):
 
 - `target_elapsed = 0.79 × 604800 / 0.9 = 530773s`
-- `sleep_s_7d = 530773 − 554400 = −23627s` → 0 (already behind pace on 7d).
+- `sleep_s_7d = 530773 − 554400 = −23627s` → 0 (already behind pace).
 
 Final sleep = `max(540, 0) = 540s`. Hook sleeps for 9 minutes, emits
 the systemMessage, and exits 0.
@@ -140,88 +169,106 @@ claude
 
 ## Distribution
 
-The hook ships as a Claude Code plugin distributed via a marketplace
-git repo. Users install with:
+Ships as a git repository with an `install.sh` script that merges the
+required entries into `~/.claude/settings.json`. **Not a Claude Code
+plugin** — the plugin manifest schema doesn't allow plugins to register
+a statusLine (only `agent` is allowlisted under `settings`). Since the
+throttle needs both a statusLine and a hook, settings-snippet
+distribution is simpler than the plugin route.
+
+Repo layout:
 
 ```
-/plugin marketplace add charlielidbury/claude-throttle
-/plugin install throttle@claude-throttle
+claude-throttle/
+├── docs/
+│   ├── initial-plan.md
+│   └── rejected-endpoint-approach.md
+├── scripts/
+│   ├── statusline.sh              # statusLine writer
+│   └── throttle.sh                # PreToolUse hook
+├── tests/
+│   ├── test-throttle.sh           # unit tests
+│   └── integration-test.sh        # integration test
+├── install.sh                     # merges entries into ~/.claude/settings.json
+├── uninstall.sh                   # removes them
+├── usage.sh                       # ad-hoc /api/oauth/usage debug helper
+└── README.md
 ```
 
-(Repo and plugin names are placeholders — fill in the real ones.)
+User flow:
 
-Plugins live in Claude Code's cache directory after install
-(`~/.claude/plugins/cache/...`) and update via `/plugin marketplace update`.
-This means:
-
-- No manual editing of `settings.json` for users.
-- Hook script lives inside the plugin directory, not in the user's
-  project. Reference it via `${CLAUDE_PLUGIN_ROOT}` in the hooks config.
-- One install, works in all projects (no per-project setup).
-- Updates propagate via the marketplace — users get fixes without re-cloning.
-
-The repo layout follows the standard Claude Code plugin convention:
-
+```bash
+git clone https://github.com/<user>/claude-throttle ~/claude-throttle
+~/claude-throttle/install.sh
+export CLAUDE_THROTTLE=0.9
+claude
 ```
-claude-throttle/                          # repo root = marketplace
-├── .claude-plugin/
-│   └── marketplace.json                  # marketplace manifest
-├── plugins/
-│   └── throttle/                         # the plugin
-│       ├── .claude-plugin/
-│       │   └── plugin.json               # plugin manifest
-│       ├── hooks/
-│       │   └── hooks.json                # hook registration
-│       ├── scripts/
-│       │   └── throttle.sh               # the hook script
-│       ├── tests/
-│       │   ├── test-throttle.sh          # unit tests
-│       │   └── integration-test.sh       # integration test
-│       └── README.md
-├── usage.sh                              # ad-hoc usage probe
-└── README.md                             # repo-level readme for GitHub
-```
+
+`install.sh` writes absolute paths into `~/.claude/settings.json` so
+nothing depends on the repo being on `$PATH`.
 
 ## Components
 
-### 1. The hook script: `scripts/throttle.sh`
+### 1. `scripts/statusline.sh`
 
 Responsibilities:
+- Read JSON from stdin (Claude Code's statusLine payload).
+- Extract `rate_limits` and current timestamp.
+- Atomically write to cache file:
+  ```json
+  {
+    "captured_at": 1777461208,
+    "rate_limits": {
+      "five_hour": {"used_percentage": 56, "resets_at": 1777468800},
+      "seven_day": {"used_percentage": 79, "resets_at": 1777482000}
+    }
+  }
+  ```
+  `rate_limits` may be `null` on cold-start ticks.
+- Print a short status string to stdout for the visible status bar
+  (e.g. `5h:56% 7d:79%`).
 
+Atomic write: write to `${CACHE_FILE}.tmp.$$` then `mv` over the real
+path. Avoids the throttle hook reading a half-written file mid-update.
+
+Cache path: `${CLAUDE_THROTTLE_CACHE:-/tmp/claude-throttle-cache.json}`.
+
+If the user already has a statusLine they want to keep, two options:
+1. They wrap our script (their statusLine calls ours and forwards the
+   output), or
+2. They use ours as their primary and we add features as needed.
+The README will document the wrapper recipe.
+
+### 2. `scripts/throttle.sh`
+
+PreToolUse hook. Responsibilities:
 - Exit 0 immediately if `CLAUDE_THROTTLE` is unset, empty, zero, or
   non-numeric.
-- Read OAuth access token from `~/.claude/.credentials.json`.
-- `GET /api/oauth/usage` with the Bearer token and beta header.
-- Validate response shape; on any failure (network, non-2xx, schema),
-  log and exit 0.
-- For each tracked window (`five_hour`, `seven_day`):
-  - If utilization < `WARMUP_THRESHOLD_PCT` (default 10), skip.
+- Read the cache file. If missing, exit 0 (no data, can't pace).
+- If cache is older than `MAX_CACHE_AGE_S` (default 300), exit 0.
+- If `rate_limits` is null (cold start), exit 0.
+- For each window (`five_hour`, `seven_day`):
+  - If `used_percentage < WARMUP_THRESHOLD_PCT` (default 10), skip.
   - Else compute `sleep_s_window` per the pacing model.
-- Sleep for `max(sleep_s_5h, sleep_s_7d)`, capped at `MAX_SLEEP` (default 540).
+- Sleep for `max(sleep_5h, sleep_7d)`, capped at `MAX_SLEEP` (default 540).
 - Log every decision to `~/.claude/throttle.log`.
 - After a non-zero sleep, emit a JSON object to stdout with a
-  `systemMessage` field summarizing the throttle (see below). Skip
-  emission when `sleep_s == 0` to avoid transcript noise.
-- On any error (no token, network failure, JSON parse fail, etc.), log
-  and exit 0 — never block the agent due to hook failure.
-
-Cache layer: store the most recent `/usage` response at
-`/tmp/claude-throttle-cache.json` with a `CACHE_TTL_S` (default 30)
-expiry. Utilization moves slowly enough that 30s staleness is
-indistinguishable from live, and this avoids hammering the endpoint on
-tool-heavy turns.
+  `systemMessage` field summarizing the throttle. Skip emission when
+  `sleep_s == 0` to avoid transcript noise.
+- On any error, log and exit 0 — never block the agent due to hook
+  failure.
 
 Inputs:
-- stdin: PreToolUse JSON event from Claude Code (read and discarded).
+- stdin: PreToolUse JSON event (read and discarded).
 - env `CLAUDE_THROTTLE`: pacing multiplier in (0, 1]. Unset, empty,
   zero, or non-numeric disables the hook.
 - env `MAX_SLEEP`: cap on a single sleep (default 540).
 - env `WARMUP_THRESHOLD_PCT`: utilization percent below which pacing is
-  bypassed for a given window (default 10). Set to 0 to disable.
-- env `CACHE_TTL_S`: cache lifetime for the `/usage` response (default 30).
+  bypassed for a given window (default 10).
+- env `MAX_CACHE_AGE_S`: cache freshness limit (default 300).
 - env `THROTTLE_LOG`: log file path (default `~/.claude/throttle.log`).
-- env `CLAUDE_CREDENTIALS`: path to credentials file (default
-  `~/.claude/.credentials.json`).
+- env `CLAUDE_THROTTLE_CACHE`: cache file path (default
+  `/tmp/claude-throttle-cache.json`).
 
 User notification:
 
@@ -230,312 +277,240 @@ on stdout:
 
 ```json
 {
-  "systemMessage": "Throttle: slept 540s (5h: 55% util at 50% elapsed; 7d: 79% util at 92% elapsed; throttle=0.9)"
+  "systemMessage": "Throttle: slept 540s (5h: 56% util at 50% elapsed; 7d: 79% util at 92% elapsed; throttle=0.9)"
 }
 ```
 
 `systemMessage` is rendered as a warning notice in the transcript that
-the user sees but is not fed back into Claude's context. This means:
-
-- The user gets visibility into when and why pacing kicked in, scrollable
-  in the session transcript without leaving the agent.
-- Claude itself doesn't see the message and doesn't spend tokens reading
-  about its own pacing — important since the whole point is to conserve
-  tokens.
-
-Do **not** use `additionalContext` for this. That field would inject the
-throttle info into Claude's context, which both wastes tokens and risks
-the agent reasoning about pacing in unhelpful ways.
+the user sees but is not fed back into Claude's context. Verify on the
+installed Claude Code version (`/hooks` and `claude --debug`) before
+relying on it; if not supported, fall back to writing the notice to
+stderr (Claude Code surfaces hook stderr as a transcript notice).
 
 Stdout discipline: only print the JSON object, and only when there was
-an actual sleep. Any other stdout content on a `PreToolUse` hook is
-parsed as JSON output and could confuse Claude Code if malformed. All
-debug logging goes to the log file or stderr, never stdout.
+an actual sleep. All debug logging goes to the log file or stderr,
+never stdout.
 
-Verify before relying on it: confirm `systemMessage` is the right output
-field for `PreToolUse` hooks against the installed Claude Code version
-(`/hooks` and `claude --debug`). If not supported on PreToolUse, fall
-back to writing the notice to stderr (Claude Code surfaces hook stderr
-as a transcript notice).
+### 3. `install.sh`
 
-### 2. Plugin manifest: `.claude-plugin/plugin.json`
-
-Standard plugin metadata:
-
-```json
-{
-  "name": "throttle",
-  "version": "0.1.0",
-  "description": "Pace Claude Code rate-limit utilization against elapsed time within billing windows",
-  "author": "your-name",
-  "homepage": "https://github.com/your-user/claude-throttle"
-}
-```
-
-### 3. Marketplace manifest: `.claude-plugin/marketplace.json`
-
-Top-level catalog so the repo can be added with `/plugin marketplace add`:
-
-```json
-{
-  "name": "claude-throttle",
-  "owner": "your-name",
-  "description": "Rate-limit-aware throttle for Claude Code background agents",
-  "plugins": [
-    {
-      "name": "throttle",
-      "source": "./plugins/throttle"
+Idempotent installer. Responsibilities:
+- Resolve absolute paths to `statusline.sh` and `throttle.sh` based on
+  the script's own location.
+- Read existing `~/.claude/settings.json` (or `{}` if missing).
+- Back it up to `~/.claude/settings.json.backup-<timestamp>`.
+- Merge in:
+  ```json
+  {
+    "statusLine": {
+      "type": "command",
+      "command": "<absolute-path>/scripts/statusline.sh"
+    },
+    "hooks": {
+      "PreToolUse": [
+        {
+          "matcher": "*",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "<absolute-path>/scripts/throttle.sh",
+              "timeout": 600
+            }
+          ]
+        }
+      ]
     }
-  ]
-}
-```
-
-### 4. Hook registration: `hooks/hooks.json`
-
-Registers the throttle hook on `PreToolUse` with matcher `*`. Use
-`${CLAUDE_PLUGIN_ROOT}` to reference the script — this resolves to the
-plugin's cache location at runtime:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/throttle.sh",
-            "timeout": 600
-          }
-        ]
-      }
-    ]
   }
-}
-```
+  ```
+- If the user already has a `statusLine` configured, refuse to
+  overwrite without `--force`. Print instructions for the wrapper
+  recipe instead.
+- If the user already has hooks for `PreToolUse`, append rather than
+  replace.
 
-`timeout: 600` allows the full 540s sleep window with margin.
+### 4. `uninstall.sh`
 
-### 5. Test harnesses: `tests/test-throttle.sh`, `tests/integration-test.sh`
+Reverses `install.sh`: removes throttle entries from
+`~/.claude/settings.json`. Keeps a backup before modifying.
+
+### 5. `tests/test-throttle.sh`, `tests/integration-test.sh`
 
 Standalone scripts that exercise the hook without going through Claude
 Code. See Test plan below.
 
 ## Implementation steps
 
-1. **Set up the repo skeleton.**
-   - Create the directory structure shown under "Distribution".
-   - Initialise git, push to GitHub. Repo can be public from day one.
+1. **Repo skeleton.** Create directory structure shown above. Done
+   except for `throttle.sh`, `install.sh`, `uninstall.sh`, and tests.
 
 2. **Verify prerequisites.**
-   - `curl` and `python3` (or `jq`) for HTTP and JSON parsing.
-   - `~/.claude/.credentials.json` exists and contains
-     `claudeAiOauth.accessToken` (true for any user logged in via
-     Claude Pro/Max).
-   - Document these in the README.
+   - `python3` (for JSON parsing and float math).
+   - Document in README.
 
-3. **Write `scripts/throttle.sh`.**
-   - Bash, `set -euo pipefail` at the top, but trap errors to log-and-exit-0.
-   - Read access token from credentials file (path overridable via env).
-   - `GET /api/oauth/usage`. Check HTTP status, parse JSON, validate
-     shape (presence of `five_hour` / `seven_day` objects with numeric
-     `utilization` and ISO `resets_at` or null).
-   - Implement TTL cache at `/tmp/claude-throttle-cache.json`.
-   - For each window, compute `elapsed_s` from `resets_at`. Skip windows
-     where `resets_at` is null.
+3. **Implement `scripts/throttle.sh`.**
+   - Bash, `set -euo pipefail`, but trap errors to log-and-exit-0.
+   - Read cache file, validate freshness.
+   - For each window, compute `elapsed_s` from `resets_at`. Skip
+     windows where `resets_at` is null or missing.
    - Apply warmup bypass per window.
    - Compute `sleep_s_window` per the pacing model. Take max across
      windows. Cap at `MAX_SLEEP`.
    - Sleep, then emit `systemMessage` JSON if sleep was non-zero.
-   - Always log: timestamp, utilization (5h, 7d), elapsed (5h, 7d),
-     sleep decision, warmup-bypass status.
+   - Always log: timestamp, both utilizations, both elapsed, sleep
+     decision, warmup-bypass status.
    - Use `python3 -c` for any float math and JSON construction; do not
      hand-build JSON strings.
 
-4. **Write the manifests** (`plugin.json`, `marketplace.json`, `hooks.json`)
-   per the templates in Components above.
+4. **Implement `install.sh` / `uninstall.sh`.**
+   - Use `python3` to merge JSON safely (preserves user's other
+     settings, handles missing keys).
+   - Back up before writing.
+   - Detect and refuse to clobber existing statusLine without `--force`.
 
 5. **Write the test harnesses** (see Test plan below).
 
-6. **Local plugin development test.**
-   - Test the plugin without publishing using `claude --plugin-dir ./plugins/throttle`.
-   - Confirm `/hooks` shows the throttle hook registered.
-   - Confirm `claude --debug` output shows the hook firing on tool calls.
+6. **Local dev test.**
+   - Already configured: `.claude/settings.json` in this repo points
+     to `scripts/statusline.sh`. Once `throttle.sh` exists, add a
+     PreToolUse hook entry.
+   - Drive an interactive session with tmux:
+     `tmux new-session -d -s test -c $(pwd) 'claude --dangerously-skip-permissions'`,
+     send prompts, inspect logs.
 
-7. **Smoke test in a real session.**
-   - With the plugin loaded via `--plugin-dir`, launch with
-     `CLAUDE_THROTTLE=0.5 claude --plugin-dir ./plugins/throttle` (low
-     multiplier so pacing kicks in fast given current real utilization).
-   - Run a few tool calls.
-   - Tail `~/.claude/throttle.log` and verify sleeps are happening.
-   - Launch without `CLAUDE_THROTTLE` set, verify zero pacing overhead
-     (no log entries, no sleeps).
-   - Launch with `CLAUDE_THROTTLE=1.0` and confirm less-aggressive
-     throttling than the 0.5 run.
+7. **End-to-end install test.**
+   - On a clean machine (or after running `uninstall.sh`), run
+     `install.sh`.
+   - Confirm `~/.claude/settings.json` has the expected entries.
+   - Run `claude` interactively, send a prompt, confirm:
+     - statusLine bar shows utilization (`5h:NN% 7d:NN%`).
+     - Cache file appears at `/tmp/claude-throttle-cache.json` with
+       fresh `captured_at` and `rate_limits`.
+     - With `CLAUDE_THROTTLE=0.5`, throttle.log shows pacing decisions.
+     - With `CLAUDE_THROTTLE` unset, no log entries appear.
 
-8. **Publish to marketplace.**
-   - Push the repo to GitHub.
-   - Add to a personal marketplace test: `/plugin marketplace add ./path`.
-   - Once verified, others can install via `/plugin marketplace add user/repo`.
+8. **Publish.**
+   - Push to GitHub.
+   - README with the install + usage flow.
 
 ## Test plan
 
 ### Unit tests for `throttle.sh`
 
-The test harness should mock the `/usage` endpoint by replacing `curl`
-(or an intermediate fetch function) with a stub that emits canned JSON.
-Test cases:
+The harness writes canned cache files at known timestamps and runs the
+hook against them. Test cases:
 
 | Case | Setup | Expected |
 |------|-------|----------|
-| Throttle disabled (unset) | `CLAUDE_THROTTLE` unset | Exit 0, no sleep, no fetch, no stdout |
-| Throttle disabled (empty) | `CLAUDE_THROTTLE=""` | Exit 0, no sleep, no fetch, no stdout |
-| Throttle disabled (zero) | `CLAUDE_THROTTLE=0` | Exit 0, no sleep, no fetch, no stdout |
-| Throttle disabled (garbage) | `CLAUDE_THROTTLE=foo` | Exit 0, no sleep, no fetch, no stdout |
-| Warmup bypass, 5h | `five_hour.utilization=5`, elapsed=0s | Exit 0, no sleep on 5h, log shows "warmup bypass" |
-| Warmup bypass, 7d | `seven_day.utilization=5`, elapsed=anything | Exit 0, no sleep on 7d |
-| Warmup bypass even when ahead | `five_hour.utilization=7.5`, elapsed=60s, throttle=0.5 | Without bypass would sleep; with bypass exits 0 |
-| Just over warmup | `five_hour.utilization=10.5`, elapsed=900s | Normal pacing applies |
-| Custom warmup threshold | `WARMUP_THRESHOLD_PCT=0`, util=0.001, elapsed=0s | Bypass disabled; should not crash on near-zero division |
-| Behind pace, throttle=1.0 | util=25, elapsed=9000s (50% of 5h) | Exit 0, sleep=0, no stdout |
-| On pace, throttle=1.0 | util=20, elapsed=3600s (20% of 5h) | Sleep ≈ 0 |
-| Ahead of pace, throttle=1.0 | util=20, elapsed=1800s (10% of 5h) | Sleep > 0, capped at 540, stdout JSON |
-| Multiplier kicks in early, throttle=0.5 | util=20, elapsed=3600s | At 1.0 this is on-pace; at 0.5 it's ahead — sleep > 0 |
-| Both windows ahead | 5h ahead by 100s, 7d ahead by 300s | Sleep = 300 (max of the two) |
-| 7d resets_at null | `seven_day.resets_at = null` | 7d ignored; sleep based on 5h only |
-| HTTP 401 | mock returns 401 | Log error, exit 0, no stdout |
-| HTTP 5xx | mock returns 500 | Log error, exit 0, no stdout |
-| Network failure | curl exits non-zero | Log error, exit 0, no stdout |
-| Invalid JSON | mock returns garbage | Log error, exit 0, no stdout |
-| Missing fields | response without `five_hour` | Log error, exit 0, no stdout |
-| Cache hit | cache file < TTL old | No fetch, decision derived from cache |
-| Cache miss (expired) | cache file > TTL old | Fetch, update cache |
-| No credentials file | unset/missing creds path | Log error, exit 0, no stdout |
-| Stdout JSON validity | any case that produces stdout | Output parses as valid JSON; `systemMessage` is a non-empty string |
+| Throttle disabled (unset) | `CLAUDE_THROTTLE` unset | Exit 0, no sleep, no cache read, no stdout |
+| Throttle disabled (empty) | `CLAUDE_THROTTLE=""` | Same |
+| Throttle disabled (zero) | `CLAUDE_THROTTLE=0` | Same |
+| Throttle disabled (garbage) | `CLAUDE_THROTTLE=foo` | Same |
+| No cache file | cache file absent | Exit 0, no sleep, log "no cache" |
+| Stale cache | `captured_at = now − 600`, `MAX_CACHE_AGE_S=300` | Exit 0, no sleep, log "stale" |
+| Cold start | cache present but `rate_limits=null` | Exit 0, no sleep, log "no rate_limits" |
+| Warmup bypass, 5h | `five_hour.used_percentage=5`, elapsed=0s | No sleep on 5h |
+| Warmup bypass even when ahead | `five_hour=7.5%`, elapsed=60s, throttle=0.5 | Sleep=0 due to bypass |
+| Just over warmup | `five_hour=10.5%`, elapsed=900s | Normal pacing applies |
+| Behind pace, throttle=1.0 | `five_hour=25%`, elapsed=9000s | Sleep=0 |
+| On pace, throttle=1.0 | `five_hour=20%`, elapsed=3600s | Sleep ≈ 0 |
+| Ahead of pace, throttle=1.0 | `five_hour=20%`, elapsed=1800s | Sleep > 0, capped at 540, stdout JSON |
+| Multiplier kicks in, throttle=0.5 | `five_hour=20%`, elapsed=3600s | Sleep > 0 |
+| Both windows ahead | 5h ahead by 100s, 7d ahead by 300s | Sleep = 300 |
+| 7d resets_at null | `seven_day.resets_at = null` | 7d ignored, sleep based on 5h |
+| Missing 7d entirely | no `seven_day` key | 7d ignored |
+| Invalid cache JSON | cache contains garbage | Log error, exit 0 |
+| Stdout JSON validity | any case that produces stdout | Output parses as valid JSON |
 
-For sleep verification, override the `sleep` builtin in the test (e.g.
-`sleep() { echo "SLEPT $1"; }`) so tests run instantly and capture the
-intended sleep duration.
-
-For stdout verification, capture stdout separately from stderr and pipe
-through `python3 -m json.tool` (or `jq -e .`) to confirm valid JSON
-when expected, or assert empty when not expected.
+For sleep verification, override `sleep` in the test
+(`sleep() { echo "SLEPT $1"; }`) so tests run instantly and capture
+intended duration.
 
 ### Integration test
 
-A second harness script that:
-1. Launches `claude -p "run ls then date then pwd" --dangerously-skip-permissions`
-   with `CLAUDE_THROTTLE=0.1` (low multiplier so even normal utilization
-   triggers a sleep).
-2. Times the run.
-3. Verifies `~/.claude/throttle.log` shows sleeps between tool calls.
-4. Verifies the `claude -p` stdout contains throttle warning notices
-   (the `systemMessage` rendering) at least once.
-5. Re-runs without `CLAUDE_THROTTLE` and confirms it's much faster, the
-   log shows no new entries, and no throttle notices appear in output.
+Drive a real Claude Code session via tmux:
+1. `install.sh` into a sandbox `~/.claude` (use `HOME` override).
+2. `tmux new-session -d -s test -c $(pwd) 'env CLAUDE_THROTTLE=0.1
+   claude --dangerously-skip-permissions'`.
+3. Send a prompt that does several tool calls.
+4. After the run, verify:
+   - Cache file is fresh and has `rate_limits`.
+   - `~/.claude/throttle.log` shows sleeps between tool calls.
+   - The `systemMessage` rendering appeared in the session transcript
+     (capture pane).
+5. Re-run with `CLAUDE_THROTTLE` unset, confirm no log entries.
 
 ### Manual checks
 
 - `/hooks` inside Claude Code shows the throttle hook registered.
 - `claude --debug` output mentions the hook firing on tool calls.
-- `./usage.sh` returns the same JSON the hook is reading.
-- Stderr from the hook (if any) appears as a `<hook name> hook error`
-  notice in the transcript — should never happen in normal operation.
+- `./usage.sh` returns the same numbers as the cache file.
+- Stderr from either script appears as a notice in the transcript.
 
 ## Edge cases and gotchas
 
-- **resets_at is null.** Window hasn't accrued usage yet (e.g. cold
-  start). Skip that window.
-- **resets_at in the past.** Clock skew or a stale cached response. Treat
-  as zero elapsed (fresh window).
-- **Window boundary.** When the active window rolls over, `utilization`
-  resets and `resets_at` advances. The pacing math still works without
-  special handling.
-- **Multiple concurrent sessions / agents.** The endpoint reports a
-  global utilization for the account. Multiple background agents pacing
-  off the same number is exactly the behavior we want.
-- **Parallel tool calls in a single session.** N parallel tool calls fire
-  N hook invocations; each reads the same cached utilization and decides
-  to sleep concurrently. Wall time is the longest sleep, not the sum.
-  Acceptable.
+- **Cache file deleted mid-session.** Hook exits 0; next statusLine
+  tick recreates it. Acceptable.
+- **resets_at in the past.** Clock skew or stale cache. Treat as zero
+  elapsed (fresh window).
+- **Window boundary crossed mid-session.** When the window rolls over,
+  statusLine reports new utilization and `resets_at`; pacing math
+  works without special handling.
+- **Multiple concurrent sessions.** All sessions write to the same
+  cache file. Last-write-wins; the data is account-global anyway, so
+  this is the correct semantics.
+- **Parallel tool calls.** N parallel tool calls fire N hook
+  invocations; they all read the same cache and decide independently.
+  Total wall time is the longest sleep, not the sum.
 - **Hook timeout.** If the hook is killed at the 600s timeout, Claude
   Code treats it as a non-blocking error and the tool call proceeds.
-  Acceptable failure mode (worst case: one un-paced tool call).
-- **Token expired.** Hook 401s, fails soft. Next `claude` invocation
-  refreshes the token; subsequent hook invocations recover.
+  Acceptable failure mode.
 - **Don't log to stdout.** PreToolUse stdout is parsed as JSON output;
-  any non-JSON stdout could confuse Claude Code. Log to a file or stderr.
-- **`set -e` and arithmetic.** Bash `(( ... ))` returning 0 with `set -e`
-  exits the script. Use `|| true` or `if (( ... )); then`.
-- **Endpoint stability.** Internal/undocumented. If the path or schema
-  changes, validate-and-fail-soft means the hook turns into a no-op
-  rather than blocking the agent. Log loudly so the user notices.
-
-## Deliverables
-
-A public git repository (e.g. `github.com/your-user/claude-throttle`)
-containing:
-
-1. `.claude-plugin/marketplace.json` — top-level marketplace catalog.
-2. `plugins/throttle/.claude-plugin/plugin.json` — plugin manifest.
-3. `plugins/throttle/hooks/hooks.json` — hook registration.
-4. `plugins/throttle/scripts/throttle.sh` — the hook itself, executable.
-5. `plugins/throttle/tests/test-throttle.sh` — unit test harness.
-6. `plugins/throttle/tests/integration-test.sh` — integration test harness.
-7. `plugins/throttle/README.md` — plugin README documenting:
-   - Prerequisites: `curl`, `python3` (for JSON parsing and float math).
-   - How to install: `/plugin marketplace add user/claude-throttle`
-     then `/plugin install throttle@claude-throttle`.
-   - How to enable: `export CLAUDE_THROTTLE=0.9` (or any value in (0, 1])
-     before `claude`. Lower values are more conservative.
-   - Recommended starting values: `0.9` for normal background use,
-     `0.5` for very conservative pacing, `1.0` for even-pacing only.
-   - How to tune: `MAX_SLEEP`, `WARMUP_THRESHOLD_PCT`, `CACHE_TTL_S`.
-   - Where logs go.
-   - How to disable temporarily: `unset CLAUDE_THROTTLE` (or set it to
-     `0`, empty, or any non-numeric value).
-   - How to uninstall: `/plugin uninstall throttle@claude-throttle`.
-8. `usage.sh` — repo-root helper that prints raw `/usage` JSON.
-9. `README.md` at repo root — short overview, links to plugin docs,
-   install instructions for the marketplace.
+  any non-JSON could confuse Claude Code. All logging goes to file or
+  stderr.
+- **`set -e` and arithmetic.** Bash `(( ... ))` returning 0 with
+  `set -e` exits the script. Use `|| true` or `if (( ... )); then`.
+- **User has existing statusLine.** `install.sh` refuses to overwrite
+  without `--force`. README documents the wrapper recipe (their
+  statusLine calls ours and forwards stdout).
+- **rate_limits absent for non-Claude.ai accounts.** statusLine
+  payload only includes `rate_limits` for Claude.ai subscribers
+  (StatusLine.tsx wraps the field in a conditional). Hook treats
+  missing field as "no signal, no pacing". For API-key users the
+  throttle is effectively a no-op — which is correct, since the
+  5h/7d windows don't apply to them.
 
 ## Open questions
 
-### Q1: Endpoint stability commitment
+### Q1: Cache age limit
 
-The `/api/oauth/usage` endpoint is the same one `/usage` calls
-internally. It works today but is undocumented. For internal/personal
-use this is fine; for a public marketplace plugin, worth a conversation
-with whoever owns the surface about: (a) stability expectations, (b)
-whether a documented public equivalent (or a `claude --usage` flag, see
-GH#20399) is on the roadmap, (c) preferred user-agent / identification
-so traffic from the plugin is distinguishable from `/usage` traffic.
+Default `MAX_CACHE_AGE_S=300` is a guess. statusLine ticks fire on
+assistant-message updates, not on a timer, so during a tool-heavy turn
+the cache could be 30–60s stale. Setting too low means we frequently
+fail open during long tool sequences; setting too high means we pace
+on data that no longer reflects reality.
 
-If a documented surface ships, switch to it. Until then, validate-and-
-fail-soft on schema mismatch is the safety net.
+Recommendation: ship at 300s, instrument the throttle log to record
+cache age on every decision, tune based on real data.
 
-### Q2: Cache strategy
+### Q2: Wrapper recipe for users with existing statusLine
 
-Whether 30s TTL is the right default.
+For users running ccstatusline or similar, the cleanest install is a
+wrapper script that calls our statusline.sh AND their existing one,
+combining the outputs. Worth shipping a `wrap-statusline.sh` template.
 
-- **Lower (e.g. 5s)** — fresher data, but on tool-heavy turns the hook
-  could fire several times per second. Mostly redundant.
-- **Higher (e.g. 60-120s)** — fewer requests, but a burst inside a
-  cache window could push utilization meaningfully past target before
-  the hook notices.
-
-Recommendation: 30s default, configurable via `CACHE_TTL_S`. Revisit
-once we have real-world throughput numbers.
+Recommendation: ship the template in v1.1 once we see how common this
+case is.
 
 ## Out of scope for v1
 
-- Pacing per-model windows (`seven_day_opus`, `seven_day_sonnet`)
-  separately. v1 paces against the aggregate `five_hour` and
-  `seven_day` only. Per-model can come later if needed.
+- Pacing per-model windows (`seven_day_opus`, `seven_day_sonnet`).
+  These are in the `/api/oauth/usage` endpoint but not in statusLine
+  `rate_limits`. v1 paces against the aggregate `five_hour` and
+  `seven_day` only.
 - Auto-resume after window exhaustion. That's `claude-auto-retry`'s job.
-- Per-agent budgets when multiple background agents share an account.
-  v1 paces against the global utilization total; per-agent allocation
-  can come later if needed.
-- Pacing against `extra_usage` (paid overage credits). Not relevant for
-  the limit-avoidance use case.
+- Per-agent budgets when multiple agents share an account. v1 paces
+  against the global utilization total.
+- Pacing against `extra_usage` (paid overage credits). Not relevant
+  for the limit-avoidance use case.
+- Non-interactive (`claude -p`) support. statusLine doesn't fire there
+  — would need the endpoint approach instead. We don't run agents in
+  this mode.

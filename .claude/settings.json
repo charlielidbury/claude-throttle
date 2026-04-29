@@ -1,0 +1,6 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "/home/charlielidbury/repos/claude-throttle/scripts/statusline.sh"
+  }
+}
