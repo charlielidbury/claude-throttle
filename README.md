@@ -13,7 +13,7 @@ For example:
 - Because this is within your limits, it doesn't get throttled at all
 - Now, you start using Claude interactively (Agent B, throttle=DISABLED) _in parallel_ with this background agent
 - Your interactive usage with Agent B causes global usage to spike
-- This causes Agent A (the throttled background agent) to slow down until global usage is below the "token usage = time usage" line.
+- This causes Agent A (the throttled background agent) to slow down until global usage is below the "token usage% = time usage%" line.
 
 TL;DR: You can fire off background agents and leave them running for days without worrying about them using up your limits and interupting your interactive usage, or other background agents.
 
@@ -29,6 +29,10 @@ Backs up the existing file before writing. Refuses to clobber an existing
 `statusLine` without `--force`.
 
 ## Use
+
+`install.sh` installs the throttle hooks on every claude session, but they lay dormant until they detect `CLAUDE_THROTTLE` env var has been set.
+
+`CLAUDE_THROTTLE` determines the _gradient_ of the line the throttler will keep usage below. `CLAUDE_THROTTLE=1` means "use all of limits", `CLAUDE_THROTTLE=0.5` means "throttle until global usage below 50%"
 
 ```sh
 export CLAUDE_THROTTLE=0.9   # multiplier in (0, 1]
