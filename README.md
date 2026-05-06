@@ -1,8 +1,21 @@
-# claude-throttle
+# Claude Throttle
 
-Pace Claude Code's rate-limit utilization against elapsed time within the
-5-hour and 7-day billing windows, so background agents don't burn through
-the limit before the window resets.
+Slows Claude down such that it stays within your 5h session limits.
+
+<img width="419" height="312" alt="image" src="https://github.com/user-attachments/assets/fc68faa8-b518-4470-90b6-4f617112ba0d" />
+
+So if you are x% the way through your 5h session limit, this will slow Claude down (by insertting a `sleep` call on every tool use) iff it has used more than x% of your tokens.
+
+Because this uses the global usage statistics, throttled claude sessions will slow down in response to _any_ usage on your account.
+
+For example:
+- You have a background Ralph Loop (Agent A, throttle=ENABLED) running which is using on average 90% of every 5h window
+- Because this is within your limits, it doesn't get throttled at all
+- Now, you start using Claude interactively (Agent B, throttle=DISABLED) _in parallel_ with this background agent
+- Your interactive usage with Agent B causes global usage to spike
+- This causes Agent A (the throttled background agent) to slow down until global usage is below the "token usage = time usage" line.
+
+TL;DR: You can fire off background agents and leave them running for days without worrying about them using up your limits and interupting your interactive usage, or other background agents.
 
 ## Install
 
@@ -29,6 +42,8 @@ throttling for that session — the hook becomes a no-op.
 Throttling only engages in interactive sessions. `claude -p` (headless)
 doesn't fire `statusLine`, so there's no live data and the hook stays
 silent.
+
+Top Tip: If you want Agent A to have _priority_ over Agent B in terms of usage, give agent A a higher multipler. For example if CLAUDE_THROTTLE=0.9 in Agent A and 0.8 in Agent B then under a high contention scenario Agent B will get throttled _first_, causing Agent A to only be slowed done once the throttler has already tried slowing down B.
 
 ## Status bar
 
