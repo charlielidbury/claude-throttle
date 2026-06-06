@@ -9,6 +9,7 @@ import {
   isDue,
   needsRefresh,
   usageScore,
+  remainingSeconds,
   USAGE_REFRESH_MS,
   ACTIVE_POLL_MS,
   INACTIVE_POLL_MS,
@@ -199,6 +200,19 @@ async function main() {
     check("robbie untouched (score null)", (st.accounts.robbie.score ?? null) === null);
     check("active unchanged", st.active === "robbie");
     rmSync(dir, { recursive: true, force: true });
+  }
+
+  // ---- countdown (remainingSeconds) ----
+  console.log("\n[remainingSeconds] usage-refresh countdown display calc");
+  {
+    check("full window when just reset", remainingSeconds(NOW + 30_000, NOW) === 30);
+    check("decrements: 23s left", remainingSeconds(NOW + 23_000, NOW) === 23);
+    check("rounds up sub-second remainder (0.4s -> 1)", remainingSeconds(NOW + 400, NOW) === 1);
+    check("rounds up 29.001s -> 30", remainingSeconds(NOW + 29_001, NOW) === 30);
+    check("clamps at 0 when due now", remainingSeconds(NOW, NOW) === 0);
+    check("clamps at 0 when overdue (past)", remainingSeconds(NOW - 5_000, NOW) === 0);
+    check("null nextRefreshAt -> 0", remainingSeconds(null, NOW) === 0);
+    check("undefined nextRefreshAt -> 0", remainingSeconds(undefined, NOW) === 0);
   }
 
   console.log(`\n==== ${passed} passed, ${failed} failed ====`);

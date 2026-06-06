@@ -109,6 +109,16 @@ export function decideAutoSwitch(input: BalanceInput): BalanceDecision {
   };
 }
 
+/**
+ * Seconds remaining until the next scheduled usage-refresh pass, for display.
+ * Rounds up (so a fresh window shows the full cadence) and clamps at 0.
+ * `nextRefreshAt` null/undefined => 0.
+ */
+export function remainingSeconds(nextRefreshAt: number | null | undefined, now: number): number {
+  if (!nextRefreshAt) return 0;
+  return Math.max(0, Math.ceil((nextRefreshAt - now) / 1000));
+}
+
 /** Score from a usage object: max(5h%, 7d%). null if usage unknown. */
 export function usageScore(
   usage: { fiveHour: { use: number }; sevenDay: { use: number } } | "loading" | "error" | null,

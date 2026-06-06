@@ -26,6 +26,7 @@ import {
   decideAutoSwitch,
   usageScore,
   runUsagePass,
+  remainingSeconds,
   USAGE_REFRESH_MS,
   type BalanceAccount,
   type PassAccount,
@@ -719,6 +720,11 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
   const [autoBalance, setAutoBalance] = useState(false);
   // All-accounts usage auto-refresh at a fixed 30s cadence (the `u` toggle, default OFF).
   const [usageRefresh, setUsageRefresh] = useState(false);
+  // Timestamp the next scheduled usage-refresh pass is due (for the countdown
+  // display only — the real fetch stays on its 30s interval).
+  const [nextRefreshAt, setNextRefreshAt] = useState<number | null>(null);
+  // Re-render driver for the 1s countdown tick.
+  const [countdownNow, setCountdownNow] = useState(() => Date.now());
   const [lastAction, setLastAction] = useState<string | null>(null);
 
   // Refs so the polling loop always sees current state (no stale closures).
@@ -928,6 +934,10 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
       const act = activeRef.current;
       const forceAll = usageRefreshRef.current;
 
+      // A pass is firing now; the next one is one cadence away. Used only by
+      // the countdown display (fetch timing is unchanged).
+      if (forceAll) setNextRefreshAt(now + USAGE_REFRESH_MS);
+
       // 1) One usage-refresh pass for the whole table.
       const passAccounts: PassAccount<Usage>[] = cur.map((s) => ({
         name: s.name,
@@ -1020,6 +1030,15 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoBalance, usageRefresh, phase]);
 
+  // Lightweight 1s display tick that re-renders the countdown. Only runs while
+  // usage-refresh is ON (no idle 1s re-render otherwise). Display-only.
+  useEffect(() => {
+    if (phase !== "table" || !usageRefresh) return;
+    setCountdownNow(Date.now()); // immediate update on toggle-on
+    const id = setInterval(() => setCountdownNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [usageRefresh, phase]);
+
   useInput(
     (input, key) => {
       if (key.upArrow || input === "k") {
@@ -1044,6 +1063,15 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
       } else if (input === "u") {
         setUsageRefresh((v) => {
           const next = !v;
+          if (next) {
+            // Seed the countdown immediately so it shows the full window, not
+            // 0s, before the first async pass sets nextRefreshAt.
+            const seed = Date.now();
+            setCountdownNow(seed);
+            setNextRefreshAt(seed + USAGE_REFRESH_MS);
+          } else {
+            setNextRefreshAt(null);
+          }
           setFlash(
             next ? `usage-refresh: ON (${Math.round(USAGE_REFRESH_MS / 1000)}s)` : "usage-refresh: OFF",
           );
@@ -1161,7 +1189,9 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
         </Text>
         <Text>{"   usage-refresh: "}</Text>
         <Text bold color={usageRefresh ? "green" : "gray"}>
-          {usageRefresh ? `ON (${Math.round(USAGE_REFRESH_MS / 1000)}s)` : "OFF"}
+          {usageRefresh
+            ? `ON (${remainingSeconds(nextRefreshAt, countdownNow)}s)`
+            : "OFF"}
         </Text>
       </Box>
 
