@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { render, Box, Text, useApp, useInput } from "ink";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -22,6 +22,13 @@ import {
   validateLabel,
   saveActiveToSlot,
 } from "./onboard";
+import {
+  decideAutoSwitch,
+  usageScore,
+  ACTIVE_POLL_MS,
+  INACTIVE_POLL_MS,
+  type BalanceAccount,
+} from "./balance";
 
 // ---------------------------------------------------------------------------
 // Paths & constants
@@ -66,11 +73,14 @@ type AccountCache = {
   org: string | null;
   uuid?: string | null;
   lastUsageAt?: number | null;
+  inRotation: boolean;
+  score?: number | null;
 };
 
 type SwitcherState = {
   active: string | null;
   accounts: Record<string, AccountCache>;
+  lastAutoSwitchAt?: number | null;
 };
 
 type Slot = {
@@ -84,7 +94,15 @@ type Slot = {
 const PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
 
 function emptyCache(): AccountCache {
-  return { email: null, displayName: null, org: null, uuid: null, lastUsageAt: null };
+  return {
+    email: null,
+    displayName: null,
+    org: null,
+    uuid: null,
+    lastUsageAt: null,
+    inRotation: true,
+    score: null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -153,15 +171,23 @@ function readState(): SwitcherState {
             org: cc.org ?? null,
             uuid: cc.uuid ?? null,
             lastUsageAt: cc.lastUsageAt ?? null,
+            // Default in-rotation TRUE when the flag is absent.
+            inRotation: cc.inRotation === undefined ? true : !!cc.inRotation,
+            score: cc.score ?? null,
           };
         }
       }
-      return { active: typeof obj.active === "string" ? obj.active : null, accounts };
+      return {
+        active: typeof obj.active === "string" ? obj.active : null,
+        accounts,
+        lastAutoSwitchAt:
+          typeof obj.lastAutoSwitchAt === "number" ? obj.lastAutoSwitchAt : null,
+      };
     }
   } catch {
     // missing or malformed -> default below
   }
-  return { active: null, accounts: {} };
+  return { active: null, accounts: {}, lastAutoSwitchAt: null };
 }
 
 function writeState(state: SwitcherState): void {
@@ -197,7 +223,11 @@ function loadState(slots: Slot[]): SwitcherState {
     }
   }
 
-  const next: SwitcherState = { active, accounts };
+  const next: SwitcherState = {
+    active,
+    accounts,
+    lastAutoSwitchAt: state.lastAutoSwitchAt ?? null,
+  };
   // Persist if anything changed (self-heal active, prune/add accounts).
   if (
     next.active !== state.active ||
@@ -235,6 +265,30 @@ function cacheProfile(
   writeState(state);
 }
 
+/** Toggle inRotation for a slot, persist immediately, return new value. */
+function toggleRotationInState(name: string): boolean {
+  const state = readState();
+  const cur = state.accounts[name] ?? emptyCache();
+  const next = !(cur.inRotation ?? true);
+  state.accounts[name] = { ...cur, inRotation: next };
+  writeState(state);
+  return next;
+}
+
+/** Cache usage score + lastUsageAt for a slot. */
+function cacheUsageInState(name: string, score: number | null, at: number): void {
+  const state = readState();
+  const cur = state.accounts[name] ?? emptyCache();
+  state.accounts[name] = { ...cur, score, lastUsageAt: at };
+  writeState(state);
+}
+
+function setLastAutoSwitchAt(at: number): void {
+  const state = readState();
+  state.lastAutoSwitchAt = at;
+  writeState(state);
+}
+
 // ---------------------------------------------------------------------------
 // Atomic writes (same-dir temp + rename, mode 0600)
 // ---------------------------------------------------------------------------
@@ -265,6 +319,42 @@ function performSwitch(target: string, currentActive: string | null): void {
   // Ensure active file keeps 0600.
   chmodSync(ACTIVE_FILE, CRED_MODE);
   setActiveInState(target);
+}
+
+/**
+ * Lock-wrapped switch used by the auto-balancer. Reads the LIVE
+ * .credentials.json at switch-out time (Claude Code may have rotated tokens)
+ * and saves THOSE bytes to the outgoing slot, all under a proper-lockfile lock
+ * on ~/.claude to avoid racing Claude Code's own refresh. Atomic 0600 writes.
+ */
+async function performSwitchSafe(
+  target: string,
+  currentActive: string | null,
+  stampAutoSwitchAt?: number,
+): Promise<void> {
+  let release: (() => Promise<void>) | null = null;
+  try {
+    release = await lockfile.lock(CLAUDE_DIR, {
+      retries: { retries: 5, factor: 1.5, minTimeout: 50, maxTimeout: 500 },
+      stale: 10000,
+    });
+  } catch {
+    release = null; // best-effort
+  }
+  try {
+    if (currentActive && currentActive !== target && existsSync(ACTIVE_FILE)) {
+      // LIVE read of the active file -> outgoing slot (captures token rotation).
+      atomicCopy(ACTIVE_FILE, slotPath(currentActive));
+    }
+    atomicCopy(slotPath(target), ACTIVE_FILE);
+    chmodSync(ACTIVE_FILE, CRED_MODE);
+    const state = readState();
+    state.active = target;
+    if (stampAutoSwitchAt !== undefined) state.lastAutoSwitchAt = stampAutoSwitchAt;
+    writeState(state);
+  } finally {
+    if (release) await release().catch(() => {});
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -423,9 +513,11 @@ type Fragment = { text: string; color?: string };
 
 type DisplayRow = {
   name: string;
+  inRotation: boolean;
   cells: {
     account: string;
     active: string;
+    rotation: string;
     tier: string;
     usage: Fragment[];
     expires: string;
@@ -435,6 +527,7 @@ type DisplayRow = {
 const HEADERS = {
   account: "Account",
   active: "Active",
+  rotation: "Rot",
   tier: "Tier",
   usage: "Usage",
   expires: "Expires",
@@ -442,6 +535,7 @@ const HEADERS = {
 const COL_ORDER: (keyof typeof HEADERS)[] = [
   "account",
   "active",
+  "rotation",
   "tier",
   "usage",
   "expires",
@@ -477,16 +571,21 @@ function accountLabel(slot: Slot): string {
 }
 
 function buildRows(slots: Slot[], active: string | null): DisplayRow[] {
-  return slots.map((s) => ({
-    name: s.name,
-    cells: {
-      account: accountLabel(s),
-      active: s.name === active ? "●" : "",
-      tier: tierLabel(s.oauth),
-      usage: buildUsageFragments(s.usage),
-      expires: expiresLabel(s.oauth.expiresAt),
-    },
-  }));
+  return slots.map((s) => {
+    const inRotation = s.cache.inRotation !== false;
+    return {
+      name: s.name,
+      inRotation,
+      cells: {
+        account: accountLabel(s),
+        active: s.name === active ? "●" : "",
+        rotation: inRotation ? "◉" : "○",
+        tier: tierLabel(s.oauth),
+        usage: buildUsageFragments(s.usage),
+        expires: expiresLabel(s.oauth.expiresAt),
+      },
+    };
+  });
 }
 
 function computeWidths(rows: DisplayRow[]): Record<keyof typeof HEADERS, number> {
@@ -614,6 +713,17 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
   const [selected, setSelected] = useState(0);
   const [flash, setFlash] = useState<string | null>(null);
   const [reloadNonce, setReloadNonce] = useState(0);
+
+  // Auto-balance mode (default OFF). lastAction surfaces what the balancer did.
+  const [autoBalance, setAutoBalance] = useState(false);
+  const [lastAction, setLastAction] = useState<string | null>(null);
+
+  // Refs so the polling loop always sees current state (no stale closures).
+  const slotsRef = useRef(slots);
+  slotsRef.current = slots;
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  const busyRef = useRef(false); // guard against overlapping ticks
 
   // Onboarding: fetch the active account's profile to suggest a label.
   const [onboardProfile, setOnboardProfile] = useState<Profile | null>(null);
@@ -783,6 +893,113 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
     setReloadNonce((n) => n + 1);
   }
 
+  /** Toggle in/out of rotation for a slot; persist + update in-memory. */
+  function toggleRotation(name: string): void {
+    const next = toggleRotationInState(name);
+    setSlots((prev) =>
+      prev.map((s) =>
+        s.name === name ? { ...s, cache: { ...s.cache, inRotation: next } } : s,
+      ),
+    );
+    setFlash(`${name}: ${next ? "in" : "out of"} rotation`);
+  }
+
+  // --- Auto-balance polling -------------------------------------------------
+  // One tick: (1) refresh stale usage for the active and in-rotation inactive
+  // accounts (refresh-token-if-expired, throttled), (2) run the decision fn,
+  // (3) if it says switch, do a lock-wrapped live-read swap.
+  async function autoBalanceTick(): Promise<void> {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    try {
+      const now = Date.now();
+      const cur = slotsRef.current;
+      const act = activeRef.current;
+
+      // 1) Refresh usage where stale.
+      await Promise.all(
+        cur.map(async (slot) => {
+          const isActive = slot.name === act;
+          const inRot = slot.cache.inRotation !== false;
+          // Only measure the active account and in-rotation inactives.
+          if (!isActive && !inRot) return;
+          const last = slot.cache.lastUsageAt ?? 0;
+          const interval = isActive ? ACTIVE_POLL_MS : INACTIVE_POLL_MS;
+          if (now - last < interval) return; // not due yet
+
+          // Inactive expired token: refresh first (throttled by the same gate).
+          let oauth = slot.oauth;
+          if (!isActive && oauth.expiresAt && oauth.expiresAt < now) {
+            try {
+              oauth = await refreshAccount(slot.name, oauth, false);
+              setSlots((prev) =>
+                prev.map((s) => (s.name === slot.name ? { ...s, oauth } : s)),
+              );
+            } catch {
+              // leave usage unknown; will show "—"
+            }
+          }
+          const usage = await fetchUsage(oauth);
+          const score = usageScore(usage);
+          cacheUsageInState(slot.name, score, Date.now());
+          setSlots((prev) =>
+            prev.map((s) =>
+              s.name === slot.name
+                ? { ...s, usage, cache: { ...s.cache, score, lastUsageAt: Date.now() } }
+                : s,
+            ),
+          );
+        }),
+      );
+
+      // 2) Decide using the freshest in-memory scores.
+      const fresh = slotsRef.current;
+      const accounts: BalanceAccount[] = fresh.map((s) => ({
+        name: s.name,
+        inRotation: s.cache.inRotation !== false,
+        score: usageScore(s.usage),
+      }));
+      const state = readState();
+      const decision = decideAutoSwitch({
+        accounts,
+        active: activeRef.current,
+        lastAutoSwitchAt: state.lastAutoSwitchAt ?? null,
+        now: Date.now(),
+      });
+
+      // 3) Act.
+      if (decision.target) {
+        const from = activeRef.current;
+        await performSwitchSafe(decision.target, from, Date.now());
+        const { slots: reloaded, active: newActive } = loadAll();
+        setSlots(reloaded);
+        setActive(newActive);
+        setReloadNonce((n) => n + 1);
+        setLastAction(
+          `auto-switched ${from}→${decision.target} (${decision.activeScore}%→${decision.candidateScore}%)`,
+        );
+      }
+    } finally {
+      busyRef.current = false;
+    }
+  }
+
+  // Drive the loop while auto-balance is ON. Tick immediately, then every 30s
+  // (the per-account poll gates above decide what actually gets re-fetched).
+  useEffect(() => {
+    if (phase !== "table" || !autoBalance) return;
+    let cancelled = false;
+    void autoBalanceTick();
+    const id = setInterval(() => {
+      if (!cancelled) void autoBalanceTick();
+    }, 30 * 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoBalance, phase]);
+
   useInput(
     (input, key) => {
       if (key.upArrow || input === "k") {
@@ -795,6 +1012,15 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
       } else if (input === "r") {
         const row = slots[selected];
         if (row) void doRefresh(row.name);
+      } else if (input === " ") {
+        const row = slots[selected];
+        if (row) toggleRotation(row.name);
+      } else if (input === "a") {
+        setAutoBalance((v) => {
+          const next = !v;
+          setFlash(`auto-balance: ${next ? "ON" : "OFF"}`);
+          return next;
+        });
       } else if (input === "q" || key.escape || (key.ctrl && input === "c")) {
         exit();
       }
@@ -843,35 +1069,45 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
     // Build the row as a sequence of <Text> fragments so the Usage cell keeps
     // its per-fragment colors. The selected row is marked with a cyan "›"
     // cursor in the gutter + a bold account name — no row-wide inverse.
+    // Out-of-rotation rows are dimmed (except the colored usage %).
+    const dim = !row.inRotation;
     const parts: React.ReactNode[] = [];
     let k = 0;
-    const push = (text: string, color?: string, bold?: boolean) =>
+    const push = (
+      text: string,
+      opts: { color?: string; bold?: boolean; dimColor?: boolean } = {},
+    ) =>
       parts.push(
-        <Text key={k++} color={color} bold={bold}>
+        <Text key={k++} color={opts.color} bold={opts.bold} dimColor={opts.dimColor}>
           {text}
         </Text>,
       );
 
     // Cursor gutter.
-    if (isSelected) push("› ", "cyan", true);
+    if (isSelected) push("› ", { color: "cyan", bold: true });
     else push(GUTTER);
 
     push("│ ");
     COL_ORDER.forEach((c, i) => {
       if (c === "usage") {
         const frags = row.cells.usage;
-        for (const f of frags) push(f.text, f.color);
+        for (const f of frags) push(f.text, { color: f.color, dimColor: dim && !f.color });
         const padN = widths.usage - fragLen(frags);
         if (padN > 0) push(" ".repeat(padN));
       } else if (c === "account") {
-        // Bold + cyan the selected account name for an extra cue.
-        push(
-          pad(row.cells.account, widths.account),
-          isSelected ? "cyan" : undefined,
-          isSelected,
-        );
+        push(pad(row.cells.account, widths.account), {
+          color: isSelected ? "cyan" : undefined,
+          bold: isSelected,
+          dimColor: dim && !isSelected,
+        });
+      } else if (c === "rotation") {
+        // Green ◉ in rotation, dim ○ out.
+        push(pad(row.cells.rotation, widths.rotation), {
+          color: row.inRotation ? "green" : undefined,
+          dimColor: !row.inRotation,
+        });
       } else {
-        push(pad(row.cells[c] as string, widths[c]));
+        push(pad(row.cells[c] as string, widths[c]), { dimColor: dim });
       }
       push(i < COL_ORDER.length - 1 ? " │ " : " │");
     });
@@ -891,6 +1127,10 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
         {active === null && (
           <Text color="yellow">{"  (active account: unknown)"}</Text>
         )}
+        <Text>{"   auto-balance: "}</Text>
+        <Text bold color={autoBalance ? "green" : "gray"}>
+          {autoBalance ? "ON" : "OFF"}
+        </Text>
       </Box>
 
       <Text>{horizontal("┌", "┬", "┐")}</Text>
@@ -903,12 +1143,22 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
 
       <Box marginTop={1}>
         <Text dimColor>
-          ↑/↓ (j/k) move · enter switch · r refresh · q quit{"   "}
+          ↑/↓ move · enter switch · space rotation · a auto-balance · r refresh · q quit
         </Text>
+      </Box>
+      <Box>
         <Text dimColor>legend: </Text>
+        <Text color="green">◉</Text>
+        <Text dimColor>in / </Text>
+        <Text dimColor>○ out of rotation · </Text>
         <Text color="red">use%</Text>
         <Text dimColor>/elapsed% (red = ahead of pace)</Text>
       </Box>
+      {lastAction && (
+        <Box>
+          <Text color="cyan">{lastAction}</Text>
+        </Box>
+      )}
       {flash && (
         <Box>
           <Text
