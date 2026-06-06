@@ -30,6 +30,60 @@ nix develop --command bun run src/index.tsx
 With [direnv](https://direnv.net): `cd switcher && direnv allow` puts `bun` on
 your PATH, then just `bun install` / `bun run src/index.tsx`.
 
+## Install (Nix)
+
+The flake builds a reproducible package with dependencies vendored offline via
+[bun2nix](https://github.com/baileyluTCD/bun2nix) (no network `bun install` at
+build time). The flake lives in `switcher/`, so reference it as `./switcher`
+(or `<repo>?dir=switcher`). The executable is `claude-switcher`.
+
+Build / run from a checkout:
+
+```sh
+nix build ./switcher#switcher     # -> ./result/bin/claude-switcher
+nix run   ./switcher#switcher     # build + run the TUI
+```
+
+Imperative profile install:
+
+```sh
+nix profile install ./switcher#switcher
+claude-switcher
+```
+
+Home Manager (`home.packages`):
+
+```nix
+# flake.nix inputs:
+#   claude-throttle.url = "github:charlielidbury/claude-throttle?dir=switcher";
+{ inputs, pkgs, ... }:
+{
+  home.packages = [
+    inputs.claude-throttle.packages.${pkgs.system}.switcher
+  ];
+}
+```
+
+NixOS (`environment.systemPackages`):
+
+```nix
+{ inputs, pkgs, ... }:
+{
+  environment.systemPackages = [
+    inputs.claude-throttle.packages.${pkgs.system}.switcher
+  ];
+}
+```
+
+### Regenerating the vendored deps
+
+After changing dependencies (and `bun.lock`), regenerate `bun.nix`:
+
+```sh
+nix develop   # provides the `bun2nix` CLI
+bun2nix -o bun.nix
+```
+
 ### Pointing at a different credentials dir
 
 By default the TUI reads/writes `~/.claude`. To run against a throwaway copy
