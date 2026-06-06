@@ -5,11 +5,17 @@ A terminal UI to view and switch between your Claude credential accounts
 5h/7d usage vs. elapsed-window pace, and token expiry.
 
 Keys: `↑/↓` move · `enter` switch · `space` toggle an account in/out of
-rotation · `a` toggle auto-balance · `r` refresh an expired token · `q` quit.
+rotation · `a` toggle auto-balance · `u` toggle 30s usage auto-refresh ·
+`r` refresh an expired token · `q` quit.
 
 Auto-balance (off by default, TUI-only — runs only while open) keeps the
 active account on the least-used in-rotation account, with hysteresis and a
 minimum dwell time so it doesn't churn.
+
+Usage auto-refresh (`u`, off by default) re-fetches usage for all accounts
+every 30s to keep the table live; token refreshes happen only once per expiry
+window, not every tick. Both loops share one timer, so enabling both does a
+single fetch pass per cycle.
 
 ## Run
 
@@ -31,4 +37,5 @@ nix develop --command bun run tests/test-refresh.ts
 nix develop --command bun run tests/test-onboard.ts
 nix develop --command bun run tests/test-balance.ts      # auto-balance decision logic
 nix develop --command bun run tests/test-autoswitch.ts   # toggle + swap file mechanics
+nix develop --command bun run tests/test-usagepass.ts    # usage auto-refresh pass
 ```

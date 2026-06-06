@@ -25,9 +25,10 @@ import {
 import {
   decideAutoSwitch,
   usageScore,
-  ACTIVE_POLL_MS,
-  INACTIVE_POLL_MS,
+  runUsagePass,
+  USAGE_REFRESH_MS,
   type BalanceAccount,
+  type PassAccount,
 } from "./balance";
 
 // ---------------------------------------------------------------------------
@@ -716,6 +717,8 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
 
   // Auto-balance mode (default OFF). lastAction surfaces what the balancer did.
   const [autoBalance, setAutoBalance] = useState(false);
+  // All-accounts usage auto-refresh at a fixed 30s cadence (the `u` toggle, default OFF).
+  const [usageRefresh, setUsageRefresh] = useState(false);
   const [lastAction, setLastAction] = useState<string | null>(null);
 
   // Refs so the polling loop always sees current state (no stale closures).
@@ -723,6 +726,10 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
   slotsRef.current = slots;
   const activeRef = useRef(active);
   activeRef.current = active;
+  const autoBalanceRef = useRef(autoBalance);
+  autoBalanceRef.current = autoBalance;
+  const usageRefreshRef = useRef(usageRefresh);
+  usageRefreshRef.current = usageRefresh;
   const busyRef = useRef(false); // guard against overlapping ticks
 
   // Onboarding: fetch the active account's profile to suggest a label.
@@ -904,101 +911,114 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
     setFlash(`${name}: ${next ? "in" : "out of"} rotation`);
   }
 
-  // --- Auto-balance polling -------------------------------------------------
-  // One tick: (1) refresh stale usage for the active and in-rotation inactive
-  // accounts (refresh-token-if-expired, throttled), (2) run the decision fn,
-  // (3) if it says switch, do a lock-wrapped live-read swap.
-  async function autoBalanceTick(): Promise<void> {
+  // --- Unified polling tick -------------------------------------------------
+  // A SINGLE driver feeds both features so they never double-fetch:
+  //   1) runUsagePass over all accounts. forceAll = usage-refresh ON, so the
+  //      whole table goes live at the 30s cadence. When only auto-balance is
+  //      ON, the pass self-gates per account (active ~60s, in-rotation
+  //      inactive ~5m, out-of-rotation skipped). Token refresh happens only
+  //      for expired/near-expiry, non-active accounts — never every tick.
+  //   2) auto-balance decision (only when ON) consumes those fresh scores.
+  async function tick(): Promise<void> {
     if (busyRef.current) return;
     busyRef.current = true;
     try {
       const now = Date.now();
       const cur = slotsRef.current;
       const act = activeRef.current;
+      const forceAll = usageRefreshRef.current;
 
-      // 1) Refresh usage where stale.
-      await Promise.all(
-        cur.map(async (slot) => {
-          const isActive = slot.name === act;
-          const inRot = slot.cache.inRotation !== false;
-          // Only measure the active account and in-rotation inactives.
-          if (!isActive && !inRot) return;
-          const last = slot.cache.lastUsageAt ?? 0;
-          const interval = isActive ? ACTIVE_POLL_MS : INACTIVE_POLL_MS;
-          if (now - last < interval) return; // not due yet
-
-          // Inactive expired token: refresh first (throttled by the same gate).
-          let oauth = slot.oauth;
-          if (!isActive && oauth.expiresAt && oauth.expiresAt < now) {
-            try {
-              oauth = await refreshAccount(slot.name, oauth, false);
-              setSlots((prev) =>
-                prev.map((s) => (s.name === slot.name ? { ...s, oauth } : s)),
-              );
-            } catch {
-              // leave usage unknown; will show "—"
-            }
-          }
-          const usage = await fetchUsage(oauth);
-          const score = usageScore(usage);
-          cacheUsageInState(slot.name, score, Date.now());
-          setSlots((prev) =>
-            prev.map((s) =>
-              s.name === slot.name
-                ? { ...s, usage, cache: { ...s.cache, score, lastUsageAt: Date.now() } }
-                : s,
-            ),
-          );
-        }),
-      );
-
-      // 2) Decide using the freshest in-memory scores.
-      const fresh = slotsRef.current;
-      const accounts: BalanceAccount[] = fresh.map((s) => ({
+      // 1) One usage-refresh pass for the whole table.
+      const passAccounts: PassAccount<Usage>[] = cur.map((s) => ({
         name: s.name,
+        isActive: s.name === act,
         inRotation: s.cache.inRotation !== false,
-        score: usageScore(s.usage),
+        expiresAt: s.oauth.expiresAt,
+        lastUsageAt: s.cache.lastUsageAt ?? null,
+        usage: s.usage,
       }));
-      const state = readState();
-      const decision = decideAutoSwitch({
-        accounts,
-        active: activeRef.current,
-        lastAutoSwitchAt: state.lastAutoSwitchAt ?? null,
-        now: Date.now(),
+
+      const results = await runUsagePass(passAccounts, now, forceAll, {
+        refreshIfExpired: async (name) => {
+          const slot = slotsRef.current.find((s) => s.name === name);
+          if (!slot) return null;
+          const fresh = await refreshAccount(name, slot.oauth, false);
+          setSlots((prev) =>
+            prev.map((s) => (s.name === name ? { ...s, oauth: fresh } : s)),
+          );
+          return { expiresAt: fresh.expiresAt };
+        },
+        fetchUsage: async (name) => {
+          // Use the freshest oauth (a refresh this pass may have updated it).
+          const slot = slotsRef.current.find((s) => s.name === name);
+          return fetchUsage(slot ? slot.oauth : cur.find((s) => s.name === name)!.oauth);
+        },
       });
 
-      // 3) Act.
-      if (decision.target) {
-        const from = activeRef.current;
-        await performSwitchSafe(decision.target, from, Date.now());
-        const { slots: reloaded, active: newActive } = loadAll();
-        setSlots(reloaded);
-        setActive(newActive);
-        setReloadNonce((n) => n + 1);
-        setLastAction(
-          `auto-switched ${from}→${decision.target} (${decision.activeScore}%→${decision.candidateScore}%)`,
+      // Apply results: update table + cache score/lastUsageAt for fetched rows.
+      const at = Date.now();
+      for (const r of results) {
+        if (!r.fetched) continue; // failures keep prior value
+        const score = usageScore(r.usage);
+        cacheUsageInState(r.name, score, at);
+        setSlots((prev) =>
+          prev.map((s) =>
+            s.name === r.name
+              ? { ...s, usage: r.usage, cache: { ...s.cache, score, lastUsageAt: at } }
+              : s,
+          ),
         );
+      }
+
+      // 2) Auto-balance decision (only when that mode is ON).
+      if (autoBalanceRef.current) {
+        const fresh = slotsRef.current;
+        const accounts: BalanceAccount[] = fresh.map((s) => ({
+          name: s.name,
+          inRotation: s.cache.inRotation !== false,
+          score: usageScore(s.usage),
+        }));
+        const state = readState();
+        const decision = decideAutoSwitch({
+          accounts,
+          active: activeRef.current,
+          lastAutoSwitchAt: state.lastAutoSwitchAt ?? null,
+          now: Date.now(),
+        });
+        if (decision.target) {
+          const from = activeRef.current;
+          await performSwitchSafe(decision.target, from, Date.now());
+          const { slots: reloaded, active: newActive } = loadAll();
+          setSlots(reloaded);
+          setActive(newActive);
+          setReloadNonce((n) => n + 1);
+          setLastAction(
+            `auto-switched ${from}→${decision.target} (${decision.activeScore}%→${decision.candidateScore}%)`,
+          );
+        }
       }
     } finally {
       busyRef.current = false;
     }
   }
 
-  // Drive the loop while auto-balance is ON. Tick immediately, then every 30s
-  // (the per-account poll gates above decide what actually gets re-fetched).
+  // Single interval driver. Runs while EITHER mode is ON. Cadence is the 30s
+  // usage-refresh rate when `u` is ON, else a 30s base poll for auto-balance
+  // (its per-account gates decide what actually re-fetches).
   useEffect(() => {
-    if (phase !== "table" || !autoBalance) return;
+    if (phase !== "table" || (!autoBalance && !usageRefresh)) return;
     let cancelled = false;
-    void autoBalanceTick();
+    const period = usageRefresh ? USAGE_REFRESH_MS : 30_000;
+    void tick();
     const id = setInterval(() => {
-      if (!cancelled) void autoBalanceTick();
-    }, 30 * 1000);
+      if (!cancelled) void tick();
+    }, period);
     return () => {
       cancelled = true;
       clearInterval(id);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoBalance, phase]);
+  }, [autoBalance, usageRefresh, phase]);
 
   useInput(
     (input, key) => {
@@ -1019,6 +1039,14 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
         setAutoBalance((v) => {
           const next = !v;
           setFlash(`auto-balance: ${next ? "ON" : "OFF"}`);
+          return next;
+        });
+      } else if (input === "u") {
+        setUsageRefresh((v) => {
+          const next = !v;
+          setFlash(
+            next ? `usage-refresh: ON (${Math.round(USAGE_REFRESH_MS / 1000)}s)` : "usage-refresh: OFF",
+          );
           return next;
         });
       } else if (input === "q" || key.escape || (key.ctrl && input === "c")) {
@@ -1131,6 +1159,10 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
         <Text bold color={autoBalance ? "green" : "gray"}>
           {autoBalance ? "ON" : "OFF"}
         </Text>
+        <Text>{"   usage-refresh: "}</Text>
+        <Text bold color={usageRefresh ? "green" : "gray"}>
+          {usageRefresh ? `ON (${Math.round(USAGE_REFRESH_MS / 1000)}s)` : "OFF"}
+        </Text>
       </Box>
 
       <Text>{horizontal("┌", "┬", "┐")}</Text>
@@ -1143,7 +1175,7 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
 
       <Box marginTop={1}>
         <Text dimColor>
-          ↑/↓ move · enter switch · space rotation · a auto-balance · r refresh · q quit
+          ↑/↓ move · enter switch · space rotation · a auto-balance · u usage-refresh · r refresh · q quit
         </Text>
       </Box>
       <Box>
