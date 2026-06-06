@@ -37,6 +37,11 @@ function check(name: string, cond: boolean, detail?: string): void {
 
 type U = { fiveHour: { use: number }; sevenDay: { use: number } } | "error";
 
+// Shared pass options for tests: treat the "error" sentinel as a transient
+// failure, and use no inter-request gap so tests run fast.
+const isError = (u: U) => u === "error";
+const fastOpts = { isError, gapMs: 0, sleep: async () => {} };
+
 const NOW = 1_000_000_000_000;
 
 function acct(over: Partial<PassAccount<U>>): PassAccount<U> {
@@ -106,6 +111,7 @@ async function main() {
         if (name === "charlie") return { fiveHour: { use: 0 }, sevenDay: { use: 84 } };
         return { fiveHour: { use: 1 }, sevenDay: { use: 2 } }; // brit, after refresh
       },
+      ...fastOpts,
     });
 
     check("all 3 accounts fetched (forceAll, despite fresh lastUsageAt)", fetchCalls.length === 3, fetchCalls.join(","));
@@ -139,6 +145,7 @@ async function main() {
         return { expiresAt: NOW + 3600_000 };
       },
       fetchUsage: async () => ({ fiveHour: { use: 3 }, sevenDay: { use: 4 } }),
+      ...fastOpts,
     });
     check("no refresh on second tick (token still valid)", refreshCalls.length === 0, refreshCalls.join(","));
     check("usage still fetched on second tick", results[0].fetched === true);
@@ -156,6 +163,7 @@ async function main() {
       fetchUsage: async () => {
         throw new Error("network down");
       },
+      ...fastOpts,
     });
     check("failed fetch -> usage unchanged (prior kept)", results[0].usage === prior);
     check("failed fetch -> fetched=false", results[0].fetched === false);
@@ -174,6 +182,7 @@ async function main() {
         fetchCalls.push(n);
         return "error";
       },
+      ...fastOpts,
     });
     check("doomed fetch skipped when still expired after failed refresh", fetchCalls.length === 0);
   }

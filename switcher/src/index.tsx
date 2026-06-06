@@ -35,7 +35,13 @@ import {
 // ---------------------------------------------------------------------------
 // Paths & constants
 // ---------------------------------------------------------------------------
-const CLAUDE_DIR = join(homedir(), ".claude");
+// CLAUDE_DIR honors an env override so the TUI can be pointed at a throwaway
+// copy for testing (NEVER mutate the real ~/.claude during verification).
+// Precedence: SWITCHER_CLAUDE_DIR > CLAUDE_CONFIG_DIR > ~/.claude.
+const CLAUDE_DIR =
+  process.env.SWITCHER_CLAUDE_DIR ||
+  process.env.CLAUDE_CONFIG_DIR ||
+  join(homedir(), ".claude");
 const ACTIVE_FILE = join(CLAUDE_DIR, ".credentials.json");
 // Our single state file (Claude Code never reads it). Replaces the old
 // .active-account pointer: holds the active slot + a per-slot profile cache.
@@ -77,6 +83,9 @@ type AccountCache = {
   lastUsageAt?: number | null;
   inRotation: boolean;
   score?: number | null;
+  // Refresh-failure tracking for exponential backoff of a dead refresh token.
+  refreshFailures?: number;
+  lastRefreshFailAt?: number | null;
 };
 
 type SwitcherState = {
@@ -104,6 +113,8 @@ function emptyCache(): AccountCache {
     lastUsageAt: null,
     inRotation: true,
     score: null,
+    refreshFailures: 0,
+    lastRefreshFailAt: null,
   };
 }
 
@@ -176,6 +187,8 @@ function readState(): SwitcherState {
             // Default in-rotation TRUE when the flag is absent.
             inRotation: cc.inRotation === undefined ? true : !!cc.inRotation,
             score: cc.score ?? null,
+            refreshFailures: cc.refreshFailures ?? 0,
+            lastRefreshFailAt: cc.lastRefreshFailAt ?? null,
           };
         }
       }
@@ -282,6 +295,27 @@ function cacheUsageInState(name: string, score: number | null, at: number): void
   const state = readState();
   const cur = state.accounts[name] ?? emptyCache();
   state.accounts[name] = { ...cur, score, lastUsageAt: at };
+  writeState(state);
+}
+
+/** Record a refresh failure for a slot (increments backoff counter). */
+function recordRefreshFailureInState(name: string, at: number): void {
+  const state = readState();
+  const cur = state.accounts[name] ?? emptyCache();
+  state.accounts[name] = {
+    ...cur,
+    refreshFailures: (cur.refreshFailures ?? 0) + 1,
+    lastRefreshFailAt: at,
+  };
+  writeState(state);
+}
+
+/** Clear refresh-failure backoff for a slot after a successful refresh. */
+function clearRefreshFailureInState(name: string): void {
+  const state = readState();
+  const cur = state.accounts[name] ?? emptyCache();
+  if (!cur.refreshFailures && !cur.lastRefreshFailAt) return;
+  state.accounts[name] = { ...cur, refreshFailures: 0, lastRefreshFailAt: null };
   writeState(state);
 }
 
@@ -412,13 +446,34 @@ function elapsedPct(resetsAtIso: string, windowMs: number, now: number): number 
   return Math.max(0, Math.min(100, Math.round(elapsed * 100)));
 }
 
+// When the API rate-limits us (429), don't keep hammering: hold off all usage
+// GETs until this timestamp (honoring Retry-After when the server sends it).
+let usageBackoffUntil = 0;
+
+function parseRetryAfterMs(res: Response): number {
+  const h = res.headers.get("retry-after");
+  if (h) {
+    const secs = Number(h);
+    if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+    const date = Date.parse(h);
+    if (Number.isFinite(date)) return Math.max(0, date - Date.now());
+  }
+  return 5000; // sane default backoff if no header
+}
+
 async function fetchUsage(oauth: OAuth): Promise<Usage> {
   // Skip a guaranteed-failing call for already-expired tokens.
   if (oauth.expiresAt && oauth.expiresAt < Date.now()) return "error";
+  // Respect an active rate-limit backoff window.
+  if (Date.now() < usageBackoffUntil) return "error";
   try {
     const res = await fetch(USAGE_URL, {
       headers: { ...USAGE_HEADERS, Authorization: `Bearer ${oauth.accessToken}` },
     });
+    if (res.status === 429) {
+      usageBackoffUntil = Date.now() + parseRetryAfterMs(res);
+      return "error";
+    }
     if (!res.ok) return "error";
     const body = (await res.json()) as {
       five_hour?: { utilization: number; resets_at: string };
@@ -946,12 +1001,15 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
         expiresAt: s.oauth.expiresAt,
         lastUsageAt: s.cache.lastUsageAt ?? null,
         usage: s.usage,
+        refreshFailures: s.cache.refreshFailures ?? 0,
+        lastRefreshFailAt: s.cache.lastRefreshFailAt ?? null,
       }));
 
       const results = await runUsagePass(passAccounts, now, forceAll, {
         refreshIfExpired: async (name) => {
           const slot = slotsRef.current.find((s) => s.name === name);
           if (!slot) return null;
+          // Throws on failure -> runUsagePass marks refreshFailed.
           const fresh = await refreshAccount(name, slot.oauth, false);
           setSlots((prev) =>
             prev.map((s) => (s.name === name ? { ...s, oauth: fresh } : s)),
@@ -963,12 +1021,43 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
           const slot = slotsRef.current.find((s) => s.name === name);
           return fetchUsage(slot ? slot.oauth : cur.find((s) => s.name === name)!.oauth);
         },
+        // "error"/"loading" are transient -> don't clobber the prior good value.
+        isError: (u) => u === "error" || u === "loading",
       });
 
-      // Apply results: update table + cache score/lastUsageAt for fetched rows.
+      // Apply results.
       const at = Date.now();
       for (const r of results) {
-        if (!r.fetched) continue; // failures keep prior value
+        // Update refresh-failure backoff bookkeeping (state file + in-memory),
+        // independent of whether the usage fetch then succeeded.
+        if (r.refreshed) {
+          clearRefreshFailureInState(r.name);
+          setSlots((prev) =>
+            prev.map((s) =>
+              s.name === r.name
+                ? { ...s, cache: { ...s.cache, refreshFailures: 0, lastRefreshFailAt: null } }
+                : s,
+            ),
+          );
+        } else if (r.refreshFailed) {
+          recordRefreshFailureInState(r.name, at);
+          setSlots((prev) =>
+            prev.map((s) =>
+              s.name === r.name
+                ? {
+                    ...s,
+                    cache: {
+                      ...s.cache,
+                      refreshFailures: (s.cache.refreshFailures ?? 0) + 1,
+                      lastRefreshFailAt: at,
+                    },
+                  }
+                : s,
+            ),
+          );
+        }
+
+        if (!r.fetched) continue; // transient failure: keep prior value (no clobber)
         const score = usageScore(r.usage);
         cacheUsageInState(r.name, score, at);
         setSlots((prev) =>

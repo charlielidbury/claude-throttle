@@ -21,6 +21,8 @@ export type AccountCache = {
   lastUsageAt?: number | null;
   inRotation?: boolean;
   score?: number | null;
+  refreshFailures?: number;
+  lastRefreshFailAt?: number | null;
 };
 
 export type SwitcherState = {
@@ -67,6 +69,8 @@ export function emptyCache(): AccountCache {
     lastUsageAt: null,
     inRotation: true,
     score: null,
+    refreshFailures: 0,
+    lastRefreshFailAt: null,
   };
 }
 
@@ -88,6 +92,8 @@ export function readState(paths: Paths): SwitcherState {
             // Default inRotation TRUE when absent (existing slots opt in).
             inRotation: cc.inRotation === undefined ? true : !!cc.inRotation,
             score: cc.score ?? null,
+            refreshFailures: cc.refreshFailures ?? 0,
+            lastRefreshFailAt: cc.lastRefreshFailAt ?? null,
           };
         }
       }

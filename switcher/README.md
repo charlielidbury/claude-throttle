@@ -30,6 +30,23 @@ nix develop --command bun run src/index.tsx
 With [direnv](https://direnv.net): `cd switcher && direnv allow` puts `bun` on
 your PATH, then just `bun install` / `bun run src/index.tsx`.
 
+### Pointing at a different credentials dir
+
+By default the TUI reads/writes `~/.claude`. To run against a throwaway copy
+(e.g. for testing) without touching your real credentials, set an env override:
+
+```sh
+SWITCHER_CLAUDE_DIR=/tmp/claude-copy bun run src/index.tsx
+```
+
+Precedence: `SWITCHER_CLAUDE_DIR` > `CLAUDE_CONFIG_DIR` > `~/.claude`.
+
+> WARNING: a copied credentials file shares the SAME refresh token as the real
+> account. Refreshing it (via `u` usage-refresh or auto-balance hitting an
+> expired token) rotates that token server-side and invalidates your real
+> login. Only run a copy with valid tokens / read-only usage, or with the
+> network mocked. Never trigger a refresh against a copy of a real token.
+
 ## Tests
 
 ```sh
@@ -38,4 +55,5 @@ nix develop --command bun run tests/test-onboard.ts
 nix develop --command bun run tests/test-balance.ts      # auto-balance decision logic
 nix develop --command bun run tests/test-autoswitch.ts   # toggle + swap file mechanics
 nix develop --command bun run tests/test-usagepass.ts    # usage auto-refresh pass
+nix develop --command bun run tests/test-passrobust.ts   # 429/no-clobber, serialization, backoff
 ```

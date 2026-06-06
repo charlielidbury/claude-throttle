@@ -8,6 +8,13 @@ export const INACTIVE_POLL_MS = 5 * 60 * 1000; // re-fetch/refresh inactive at m
 export const USAGE_REFRESH_MS = 30_000; // all-accounts usage refresh cadence (the `u` toggle)
 // Treat tokens expiring within this window as needing a refresh before a usage fetch.
 export const NEAR_EXPIRY_MS = 60_000;
+// Small gap between sequential requests in a pass, to avoid bursting the API.
+export const PASS_REQUEST_GAP_MS = 250;
+// Exponential backoff for a repeatedly-failing token refresh (dead refresh
+// token etc.): wait base * 2^(failures-1), capped. Prevents hammering /token
+// every tick (which both wastes calls and contributes to rate-limit bursts).
+export const REFRESH_BACKOFF_BASE_MS = 60_000; // 1 min after the first failure
+export const REFRESH_BACKOFF_MAX_MS = 30 * 60_000; // capped at 30 min
 
 export type BalanceAccount = {
   name: string;
@@ -137,6 +144,9 @@ export type PassAccount<U> = {
   expiresAt: number; // epoch ms; 0/absent => treat as unknown/expired
   lastUsageAt: number | null;
   usage: U; // current usage value (left unchanged on fetch failure)
+  // Refresh-failure tracking, for exponential backoff of a dead refresh token.
+  refreshFailures?: number;
+  lastRefreshFailAt?: number | null;
 };
 
 export type PassCallbacks<U> = {
@@ -144,14 +154,53 @@ export type PassCallbacks<U> = {
   refreshIfExpired: (name: string) => Promise<{ expiresAt: number } | null>;
   /** Fetch usage for an account; returns the new usage value. */
   fetchUsage: (name: string) => Promise<U>;
+  /**
+   * True if a usage value represents a transient failure (e.g. the "error"
+   * sentinel from an HTTP error / 429). Such values MUST NOT clobber a prior
+   * good value, so the pass reports them as fetched:false.
+   */
+  isError: (usage: U) => boolean;
+  /** Optional sleep between sequential requests (defaults to a real timer). */
+  sleep?: (ms: number) => Promise<void>;
+  /** Gap between requests; defaults to PASS_REQUEST_GAP_MS. */
+  gapMs?: number;
 };
 
 export type PassResult<U> = {
   name: string;
   usage: U;
   refreshed: boolean; // whether a token refresh was performed this pass
-  fetched: boolean; // whether a usage fetch was performed this pass
+  fetched: boolean; // whether a usage fetch SUCCEEDED this pass (false on error)
+  refreshFailed: boolean; // whether a refresh attempt failed this pass
+  refreshSkippedBackoff: boolean; // whether refresh was skipped due to backoff
 };
+
+const realSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * How long to wait before retrying a refresh, given consecutive failures.
+ * 0 failures => 0 (no wait). Exponential from REFRESH_BACKOFF_BASE_MS, capped.
+ */
+export function refreshBackoffMs(consecutiveFailures: number): number {
+  if (consecutiveFailures <= 0) return 0;
+  const ms = REFRESH_BACKOFF_BASE_MS * Math.pow(2, consecutiveFailures - 1);
+  return Math.min(ms, REFRESH_BACKOFF_MAX_MS);
+}
+
+/**
+ * Whether a refresh is currently backed off given the last failure time and
+ * the consecutive-failure count.
+ */
+export function isRefreshBackedOff(
+  lastRefreshFailAt: number | null | undefined,
+  consecutiveFailures: number | undefined,
+  now: number,
+): boolean {
+  const fails = consecutiveFailures ?? 0;
+  if (fails <= 0 || !lastRefreshFailAt) return false;
+  return now - lastRefreshFailAt < refreshBackoffMs(fails);
+}
 
 /**
  * Decide whether an account is due for a usage fetch this tick.
@@ -177,9 +226,19 @@ export function needsRefresh<U>(a: PassAccount<U>, now: number): boolean {
 
 /**
  * Run one usage-refresh pass over the given accounts.
- * For each DUE account: refresh the token only if expired/near-expiry (and not
- * active), then fetch usage. Returns per-account results. Pure orchestration —
- * all I/O goes through the injected callbacks, so it is fully testable.
+ *
+ * Requests are issued SEQUENTIALLY (concurrency 1) with a small gap between
+ * them — never a Promise.all burst — because a refresh POST firing alongside
+ * other accounts' usage GETs trips Anthropic's rate limit (HTTP 429), which
+ * then poisons the GETs. A refresh is only attempted for expired/near-expiry,
+ * non-active accounts, and is skipped while backed off after repeated failures.
+ *
+ * A usage result the caller flags as an error (cb.isError) is reported as
+ * fetched:false so the apply step keeps the prior good value instead of
+ * clobbering it with "—".
+ *
+ * Pure orchestration — all I/O goes through the injected callbacks, so it is
+ * fully testable.
  */
 export async function runUsagePass<U>(
   accounts: PassAccount<U>[],
@@ -187,34 +246,70 @@ export async function runUsagePass<U>(
   forceAll: boolean,
   cb: PassCallbacks<U>,
 ): Promise<PassResult<U>[]> {
-  return Promise.all(
-    accounts.map(async (a): Promise<PassResult<U>> => {
-      if (!isDue(a, now, forceAll)) {
-        return { name: a.name, usage: a.usage, refreshed: false, fetched: false };
-      }
-      let refreshed = false;
-      let expiresAt = a.expiresAt;
-      if (needsRefresh(a, now)) {
+  const sleep = cb.sleep ?? realSleep;
+  const gapMs = cb.gapMs ?? PASS_REQUEST_GAP_MS;
+  const results: PassResult<U>[] = [];
+  let issued = 0; // count of actual network requests, to pace the gap
+
+  for (const a of accounts) {
+    const base: PassResult<U> = {
+      name: a.name,
+      usage: a.usage,
+      refreshed: false,
+      fetched: false,
+      refreshFailed: false,
+      refreshSkippedBackoff: false,
+    };
+
+    if (!isDue(a, now, forceAll)) {
+      results.push(base);
+      continue;
+    }
+
+    let expiresAt = a.expiresAt;
+
+    // --- refresh (only if needed and not backed off) ---
+    if (needsRefresh(a, now)) {
+      if (isRefreshBackedOff(a.lastRefreshFailAt, a.refreshFailures, now)) {
+        base.refreshSkippedBackoff = true;
+      } else {
+        if (issued > 0) await sleep(gapMs);
+        issued++;
         try {
           const r = await cb.refreshIfExpired(a.name);
           if (r) {
-            refreshed = true;
+            base.refreshed = true;
             expiresAt = r.expiresAt;
+          } else {
+            base.refreshFailed = true; // callback signalled failure (null)
           }
         } catch {
-          // leave token as-is; the usage fetch will likely fail -> unchanged usage
+          base.refreshFailed = true;
         }
       }
-      // If still expired after a failed/absent refresh, skip the doomed fetch.
-      if (!a.isActive && expiresAt && expiresAt <= now) {
-        return { name: a.name, usage: a.usage, refreshed, fetched: false };
+    }
+
+    // If still expired (refresh failed/absent), skip the doomed usage GET.
+    if (!a.isActive && expiresAt && expiresAt <= now) {
+      results.push(base);
+      continue;
+    }
+
+    // --- usage GET ---
+    if (issued > 0) await sleep(gapMs);
+    issued++;
+    try {
+      const usage = await cb.fetchUsage(a.name);
+      if (cb.isError(usage)) {
+        // Transient failure (e.g. 429) — do NOT overwrite the prior value.
+        results.push(base);
+      } else {
+        results.push({ ...base, usage, fetched: true });
       }
-      try {
-        const usage = await cb.fetchUsage(a.name);
-        return { name: a.name, usage, refreshed, fetched: true };
-      } catch {
-        return { name: a.name, usage: a.usage, refreshed, fetched: false };
-      }
-    }),
-  );
+    } catch {
+      results.push(base); // keep prior value
+    }
+  }
+
+  return results;
 }
