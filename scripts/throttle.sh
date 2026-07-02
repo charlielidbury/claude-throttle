@@ -40,7 +40,7 @@ except Exception:
 ' 2>/dev/null) || session_id=""
 
 MAX_SLEEP="${MAX_SLEEP:-540}"
-WARMUP_THRESHOLD_PCT="${WARMUP_THRESHOLD_PCT:-10}"
+WARMUP_THRESHOLD_PCT="${WARMUP_THRESHOLD_PCT:-50}"
 MAX_CACHE_AGE_S="${MAX_CACHE_AGE_S:-1800}"
 THROTTLE_LOG="${THROTTLE_LOG:-$HOME/.claude/throttle.log}"
 CACHE_FILE="${CLAUDE_THROTTLE_CACHE:-/tmp/claude-throttle-cache.json}"

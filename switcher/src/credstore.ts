@@ -23,6 +23,12 @@ export type AccountCache = {
   score?: number | null;
   refreshFailures?: number;
   lastRefreshFailAt?: number | null;
+  // Fingerprint of the slot's credential identity (a hash of the refresh token)
+  // at the time the cached email/displayName/uuid were resolved. If the slot
+  // file later holds a DIFFERENT account, the fingerprint no longer matches and
+  // the cached identity is treated as stale (cleared on load). A normal in-place
+  // token refresh updates this alongside, so rotation does NOT invalidate.
+  identityFingerprint?: string | null;
 };
 
 export type SwitcherState = {
@@ -71,6 +77,7 @@ export function emptyCache(): AccountCache {
     score: null,
     refreshFailures: 0,
     lastRefreshFailAt: null,
+    identityFingerprint: null,
   };
 }
 
@@ -94,6 +101,7 @@ export function readState(paths: Paths): SwitcherState {
             score: cc.score ?? null,
             refreshFailures: cc.refreshFailures ?? 0,
             lastRefreshFailAt: cc.lastRefreshFailAt ?? null,
+            identityFingerprint: cc.identityFingerprint ?? null,
           };
         }
       }

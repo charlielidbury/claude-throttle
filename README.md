@@ -85,7 +85,7 @@ API response yet), the hook is a no-op.
 |---|---|---|
 | `CLAUDE_THROTTLE` | unset | Multiplier (0, 1]. Required to engage. |
 | `MAX_SLEEP` | 540 | Per-call sleep cap, seconds. |
-| `WARMUP_THRESHOLD_PCT` | 10 | Skip pacing while a window's util < this %. |
+| `WARMUP_THRESHOLD_PCT` | 50 | Skip pacing while a window's util < this %. |
 | `MAX_CACHE_AGE_S` | 1800 | Treat older cache as missing. |
 | `THROTTLE_LOG` | `~/.claude/throttle.log` | Log path. |
 | `CLAUDE_THROTTLE_CACHE` | `/tmp/claude-throttle-cache.json` | Cache path. |

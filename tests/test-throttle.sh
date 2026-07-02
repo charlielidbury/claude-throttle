@@ -367,23 +367,35 @@ test_warmup_bypass_when_ahead() {
     && assert_log_matches "warmup"
 }
 
-# 10. Just over warmup: 5h=10.5%, elapsed=900s (resets_at = now+17100)
-# At throttle=1.0: target = 0.105 * 18000 = 1890; sleep = 1890-900 = 990, capped to 540
+# 9b. Raised warmup default (50%): mid-range usage that WOULD have throttled
+# under the old 10% threshold is now bypassed. 5h=40%, ahead (resets_at = now+16200).
+test_warmup_mid_range() {
+  reset_state
+  write_cache 0 40 16200
+  CLAUDE_THROTTLE="0.9" run_throttle
+  assert_exit_zero \
+    && assert_no_stdout \
+    && assert_no_sleep \
+    && assert_log_matches "warmup"
+}
+
+# 10. Just over warmup: 5h=51%, elapsed=9000s (resets_at = now+9000)
+# At throttle=1.0: target = 0.51 * 18000 = 9180; sleep = 9180-9000 = 180
 test_just_over_warmup() {
   reset_state
-  write_cache 0 10.5 17100
+  write_cache 0 51 9000
   CLAUDE_THROTTLE="1.0" run_throttle
   assert_exit_zero \
-    && assert_sleep_eq 540 \
+    && assert_sleep_eq 180 \
     && assert_stdout_valid_systemmessage \
     && assert_log_matches "sleep:"
 }
 
-# 11. Behind pace, throttle=1.0: 5h=25%, elapsed=9000s (resets_at = now+9000)
-# target = 0.25 * 18000 = 4500; sleep = max(0, 4500-9000) = 0
+# 11. Behind pace, throttle=1.0: 5h=60%, elapsed=14400s (resets_at = now+3600)
+# target = 0.6 * 18000 = 10800; sleep = max(0, 10800-14400) = 0
 test_behind_pace() {
   reset_state
-  write_cache 0 25 9000
+  write_cache 0 60 3600
   CLAUDE_THROTTLE="1.0" run_throttle
   assert_exit_zero \
     && assert_no_stdout \
@@ -391,11 +403,11 @@ test_behind_pace() {
     && assert_log_matches "skip:"
 }
 
-# 12. On pace, throttle=1.0: 5h=20%, elapsed=3600s (resets_at = now+14400)
-# target = 0.2 * 18000 = 3600; sleep = max(0, 3600-3600) = 0
+# 12. On pace, throttle=1.0: 5h=60%, elapsed=10800s (resets_at = now+7200)
+# target = 0.6 * 18000 = 10800; sleep = max(0, 10800-10800) = 0
 test_on_pace() {
   reset_state
-  write_cache 0 20 14400
+  write_cache 0 60 7200
   CLAUDE_THROTTLE="1.0" run_throttle
   assert_exit_zero \
     && assert_no_stdout \
@@ -403,11 +415,11 @@ test_on_pace() {
     && assert_log_matches "skip:"
 }
 
-# 13. Ahead of pace, throttle=1.0: 5h=20%, elapsed=1800s (resets_at = now+16200)
-# target = 0.2 * 18000 = 3600; sleep = 3600-1800 = 1800, capped to 540
+# 13. Ahead of pace, throttle=1.0: 5h=60%, elapsed=1800s (resets_at = now+16200)
+# target = 0.6 * 18000 = 10800; sleep = 10800-1800 = 9000, capped to 540
 test_ahead_of_pace_capped() {
   reset_state
-  write_cache 0 20 16200
+  write_cache 0 60 16200
   CLAUDE_THROTTLE="1.0" run_throttle
   assert_exit_zero \
     && assert_sleep_eq 540 \
@@ -415,11 +427,11 @@ test_ahead_of_pace_capped() {
     && assert_log_matches "sleep:"
 }
 
-# 14. Multiplier kicks in, throttle=0.5: 5h=20%, elapsed=3600s (resets_at = now+14400)
-# target = 0.2 * 18000 / 0.5 = 7200; sleep = 7200-3600 = 3600, capped to 540
+# 14. Multiplier kicks in, throttle=0.5: 5h=60%, elapsed=10800s (resets_at = now+7200)
+# target = 0.6 * 18000 / 0.5 = 21600; sleep = 21600-10800 = 10800, capped to 540
 test_multiplier_kicks_in() {
   reset_state
-  write_cache 0 20 14400
+  write_cache 0 60 7200
   CLAUDE_THROTTLE="0.5" run_throttle
   assert_exit_zero \
     && assert_sleep_eq 540 \
@@ -428,11 +440,11 @@ test_multiplier_kicks_in() {
 }
 
 # 15. Both windows ahead: 5h ahead by 100s, 7d ahead by 300s; sleep = 300
-# 5h: choose used_pct=30%, want sleep=100. target = 0.3*18000/1.0 = 5400; elapsed = 5300; remaining=12700
-# 7d: choose used_pct=50%, want sleep=300. target = 0.5*604800/1.0 = 302400; elapsed = 302100; remaining = 302700
+# 5h: used_pct=60%, want sleep=100. target = 0.6*18000/1.0 = 10800; elapsed = 10700; remaining = 7300
+# 7d: used_pct=60%, want sleep=300. target = 0.6*604800/1.0 = 362880; elapsed = 362580; remaining = 242220
 test_both_windows_max() {
   reset_state
-  write_cache 0 30 12700 50 302700
+  write_cache 0 60 7300 60 242220
   CLAUDE_THROTTLE="1.0" MAX_SLEEP="540" run_throttle
   assert_exit_zero \
     && assert_sleep_eq 300 \
@@ -444,7 +456,7 @@ test_both_windows_max() {
 # 5h ahead by 100s as above
 test_7d_resets_at_null() {
   reset_state
-  write_cache 0 30 12700 50 null
+  write_cache 0 60 7300 60 null
   CLAUDE_THROTTLE="1.0" run_throttle
   assert_exit_zero \
     && assert_sleep_eq 100 \
@@ -454,7 +466,7 @@ test_7d_resets_at_null() {
 # 17. Missing 7d entirely
 test_missing_7d() {
   reset_state
-  write_cache 0 30 12700 absent
+  write_cache 0 60 7300 absent
   CLAUDE_THROTTLE="1.0" run_throttle
   assert_exit_zero \
     && assert_sleep_eq 100 \
@@ -475,7 +487,7 @@ test_invalid_cache_json() {
 # 19. Stdout JSON validity for the canonical sleep case
 test_stdout_json_validity() {
   reset_state
-  write_cache 0 20 16200
+  write_cache 0 60 16200
   CLAUDE_THROTTLE="1.0" run_throttle
   assert_exit_zero \
     && assert_stdout_valid_systemmessage
@@ -484,7 +496,7 @@ test_stdout_json_validity() {
 # 20. Stats file is created on first sleep when session_id is in stdin
 test_stats_first_sleep() {
   reset_state
-  write_cache 0 20 16200   # ahead-of-pace, sleep capped to 540
+  write_cache 0 60 16200   # ahead-of-pace, sleep capped to 540
   CLAUDE_THROTTLE="1.0" run_throttle "$(make_input s-001)"
   assert_exit_zero \
     && assert_sleep_eq 540 \
@@ -494,11 +506,11 @@ test_stats_first_sleep() {
 # 21. Two consecutive sleeps in the same session: counter=2, total summed
 test_stats_two_sleeps() {
   reset_state
-  write_cache 0 20 16200
+  write_cache 0 60 16200
   CLAUDE_THROTTLE="1.0" run_throttle "$(make_input s-002)"
   assert_exit_zero || return 1
   # second invocation in same session, same canned cache
-  write_cache 0 20 16200
+  write_cache 0 60 16200
   CLAUDE_THROTTLE="1.0" run_throttle "$(make_input s-002)"
   assert_exit_zero \
     && assert_stats "s-002" 2 1080
@@ -507,7 +519,7 @@ test_stats_two_sleeps() {
 # 22. Sleep with malformed stdin (no session_id): sleep happens, no stats file
 test_stats_no_session_id() {
   reset_state
-  write_cache 0 20 16200
+  write_cache 0 60 16200
   CLAUDE_THROTTLE="1.0" run_throttle "$(make_input absent)"
   assert_exit_zero \
     && assert_sleep_eq 540 \
@@ -517,7 +529,7 @@ test_stats_no_session_id() {
 # 23. Throttle disabled: no stats writing even with session_id
 test_stats_throttle_disabled() {
   reset_state
-  write_cache 0 20 16200
+  write_cache 0 60 16200
   CLAUDE_THROTTLE="" run_throttle "$(make_input s-003)"
   assert_exit_zero \
     && assert_no_sleep \
@@ -527,7 +539,7 @@ test_stats_throttle_disabled() {
 # 24. Skip path doesn't write stats (behind pace, has session_id)
 test_stats_skip_path_no_write() {
   reset_state
-  write_cache 0 25 9000  # behind pace
+  write_cache 0 60 3600  # behind pace
   CLAUDE_THROTTLE="1.0" run_throttle "$(make_input s-004)"
   assert_exit_zero \
     && assert_no_sleep \
@@ -545,6 +557,7 @@ run "stale cache"                      test_stale_cache
 run "cold start (rate_limits null)"    test_cold_start
 run "warmup bypass, 5h"                test_warmup_5h
 run "warmup bypass even when ahead"    test_warmup_bypass_when_ahead
+run "warmup bypass mid-range (50%)"    test_warmup_mid_range
 run "just over warmup"                 test_just_over_warmup
 run "behind pace, throttle=1.0"        test_behind_pace
 run "on pace, throttle=1.0"            test_on_pace

@@ -1,15 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { render, Box, Text, useApp, useInput } from "ink";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import {
-  readdirSync,
-  readFileSync,
-  writeFileSync,
-  renameSync,
-  existsSync,
-  chmodSync,
-} from "node:fs";
+import { readFileSync, existsSync, chmodSync } from "node:fs";
 import lockfile from "proper-lockfile";
 import {
   refreshOAuth,
@@ -31,313 +22,139 @@ import {
   type BalanceAccount,
   type PassAccount,
 } from "./balance";
+import {
+  readState,
+  writeState,
+  emptyCache,
+  atomicWriteBuffer,
+  type Paths,
+  type AccountCache,
+} from "./credstore";
+import {
+  paths,
+  claudeDir,
+  discoverSlots,
+  loadAll,
+  fetchUsage,
+  fetchProfile,
+  readOAuth,
+  mergeProfileIntoCache,
+  identityFingerprint,
+  CRED_MODE,
+  type OAuth,
+  type Usage,
+  type Slot,
+  type Profile,
+} from "./core";
+import {
+  buildRows,
+  computeWidths,
+  fragLen,
+  pad,
+  HEADERS,
+  COL_ORDER,
+  type DisplayRow,
+} from "./table";
+import { runCli } from "./cli";
 
 // ---------------------------------------------------------------------------
-// Paths & constants
+// Paths (env-aware; resolved once for the TUI process).
 // ---------------------------------------------------------------------------
-// CLAUDE_DIR honors an env override so the TUI can be pointed at a throwaway
-// copy for testing (NEVER mutate the real ~/.claude during verification).
-// Precedence: SWITCHER_CLAUDE_DIR > CLAUDE_CONFIG_DIR > ~/.claude.
-const CLAUDE_DIR =
-  process.env.SWITCHER_CLAUDE_DIR ||
-  process.env.CLAUDE_CONFIG_DIR ||
-  join(homedir(), ".claude");
-const ACTIVE_FILE = join(CLAUDE_DIR, ".credentials.json");
-// Our single state file (Claude Code never reads it). Replaces the old
-// .active-account pointer: holds the active slot + a per-slot profile cache.
-const STATE_FILE = join(CLAUDE_DIR, ".credentials-switcher.json");
-const SLOT_RE = /^\.(.+)\.credentials\.json$/;
-const CRED_MODE = 0o600;
+const PATHS: Paths = paths();
+const CLAUDE_DIR = claudeDir();
+const ACTIVE_FILE = PATHS.active;
 
-const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
-const SEVEN_DAY_MS = 7 * 24 * 60 * 60 * 1000;
-
-const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
-const USAGE_HEADERS = {
-  "anthropic-beta": "oauth-2025-04-20",
-  "Content-Type": "application/json",
-};
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-type OAuth = {
-  accessToken: string;
-  refreshToken: string;
-  expiresAt: number;
-  scopes: string[];
-  subscriptionType?: string;
-  rateLimitTier?: string;
-};
-
-type CredFile = { claudeAiOauth: OAuth };
-
-type Window = { use: number; elapsed: number };
-type Usage = { fiveHour: Window; sevenDay: Window } | "loading" | "error";
-
-type AccountCache = {
-  email: string | null;
-  displayName: string | null;
-  org: string | null;
-  uuid?: string | null;
-  lastUsageAt?: number | null;
-  inRotation: boolean;
-  score?: number | null;
-  // Refresh-failure tracking for exponential backoff of a dead refresh token.
-  refreshFailures?: number;
-  lastRefreshFailAt?: number | null;
-};
-
-type SwitcherState = {
-  active: string | null;
-  accounts: Record<string, AccountCache>;
-  lastAutoSwitchAt?: number | null;
-};
-
-type Slot = {
-  name: string;
-  path: string;
-  oauth: OAuth;
-  usage: Usage;
-  cache: AccountCache;
-};
-
-const PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
-
-function emptyCache(): AccountCache {
-  return {
-    email: null,
-    displayName: null,
-    org: null,
-    uuid: null,
-    lastUsageAt: null,
-    inRotation: true,
-    score: null,
-    refreshFailures: 0,
-    lastRefreshFailAt: null,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Slot discovery
-// ---------------------------------------------------------------------------
 function slotPath(name: string): string {
-  return join(CLAUDE_DIR, `.${name}.credentials.json`);
-}
-
-function readOAuth(path: string): OAuth {
-  const data = JSON.parse(readFileSync(path, "utf8")) as CredFile;
-  return data.claudeAiOauth;
-}
-
-function discoverSlots(): Slot[] {
-  const entries = readdirSync(CLAUDE_DIR);
-  const slots: Slot[] = [];
-  for (const entry of entries) {
-    if (entry === ".credentials.json") continue;
-    const m = entry.match(SLOT_RE);
-    if (!m) continue;
-    const name = m[1];
-    const path = join(CLAUDE_DIR, entry);
-    try {
-      slots.push({
-        name,
-        path,
-        oauth: readOAuth(path),
-        usage: "loading",
-        cache: emptyCache(),
-      });
-    } catch {
-      // skip unparseable slot files
-    }
-  }
-  slots.sort((a, b) => a.name.localeCompare(b.name));
-  return slots;
+  return PATHS.slot(name);
 }
 
 // ---------------------------------------------------------------------------
-// State file (.credentials-switcher.json) — our single source of switcher state
+// State mutators (TUI-internal; read-modify-write of the state file)
 // ---------------------------------------------------------------------------
-function bytesEqual(a: string, b: string): boolean {
-  try {
-    const ba = readFileSync(a);
-    const bb = readFileSync(b);
-    return ba.length === bb.length && ba.equals(bb);
-  } catch {
-    return false;
-  }
-}
-
-/** Read+validate the state file. Missing/malformed -> empty default. */
-function readState(): SwitcherState {
-  try {
-    const raw = JSON.parse(readFileSync(STATE_FILE, "utf8")) as unknown;
-    if (raw && typeof raw === "object") {
-      const obj = raw as Partial<SwitcherState>;
-      const accounts: Record<string, AccountCache> = {};
-      if (obj.accounts && typeof obj.accounts === "object") {
-        for (const [name, c] of Object.entries(obj.accounts)) {
-          const cc = (c ?? {}) as Partial<AccountCache>;
-          accounts[name] = {
-            email: cc.email ?? null,
-            displayName: cc.displayName ?? null,
-            org: cc.org ?? null,
-            uuid: cc.uuid ?? null,
-            lastUsageAt: cc.lastUsageAt ?? null,
-            // Default in-rotation TRUE when the flag is absent.
-            inRotation: cc.inRotation === undefined ? true : !!cc.inRotation,
-            score: cc.score ?? null,
-            refreshFailures: cc.refreshFailures ?? 0,
-            lastRefreshFailAt: cc.lastRefreshFailAt ?? null,
-          };
-        }
-      }
-      return {
-        active: typeof obj.active === "string" ? obj.active : null,
-        accounts,
-        lastAutoSwitchAt:
-          typeof obj.lastAutoSwitchAt === "number" ? obj.lastAutoSwitchAt : null,
-      };
-    }
-  } catch {
-    // missing or malformed -> default below
-  }
-  return { active: null, accounts: {}, lastAutoSwitchAt: null };
-}
-
-function writeState(state: SwitcherState): void {
-  atomicWriteBuffer(STATE_FILE, JSON.stringify(state, null, 2) + "\n");
+/** Update the active field in the state file (read-modify-write, atomic). */
+function setActiveInState(name: string | null): void {
+  const state = readState(PATHS);
+  state.active = name;
+  writeState(PATHS, state);
 }
 
 /**
- * Resolve active slot + reconcile the state file against the slots on disk.
- * - active: from state.active if it still exists; else byte-compare and self-heal.
- * - accounts: prune missing slots, add entries for new slots (preserving caches).
- * Returns the (possibly updated) state, which is written back if it changed.
+ * Merge a profile into the cache for one slot. Self-corrects on a uuid change
+ * (a different account in this slot replaces the identity) and stamps the
+ * slot's identity fingerprint so a later load trusts the cache. Pass the slot's
+ * current oauth so the fingerprint matches the live token.
  */
-function loadState(slots: Slot[]): SwitcherState {
-  const state = readState();
-  const names = new Set(slots.map((s) => s.name));
-
-  // Reconcile accounts: keep existing caches, add new, drop gone.
-  const accounts: Record<string, AccountCache> = {};
-  for (const s of slots) {
-    accounts[s.name] = state.accounts[s.name] ?? emptyCache();
-  }
-
-  // Resolve active.
-  let active: string | null = null;
-  if (state.active && names.has(state.active)) {
-    active = state.active;
-  } else if (existsSync(ACTIVE_FILE)) {
-    for (const s of slots) {
-      if (bytesEqual(ACTIVE_FILE, s.path)) {
-        active = s.name; // self-heal below
-        break;
-      }
-    }
-  }
-
-  const next: SwitcherState = {
-    active,
-    accounts,
-    lastAutoSwitchAt: state.lastAutoSwitchAt ?? null,
-  };
-  // Persist if anything changed (self-heal active, prune/add accounts).
-  if (
-    next.active !== state.active ||
-    JSON.stringify(next.accounts) !== JSON.stringify(state.accounts)
-  ) {
-    try {
-      writeState(next);
-    } catch {
-      // non-fatal: UI still works from in-memory state
-    }
-  }
-  return next;
-}
-
-/** Update the active field in the state file (read-modify-write, atomic). */
-function setActiveInState(name: string | null): void {
-  const state = readState();
-  state.active = name;
-  writeState(state);
-}
-
-/** Merge a profile into the cache for one slot, never clobbering with nulls. */
 function cacheProfile(
   name: string,
   profile: { email?: string | null; displayName?: string | null; uuid?: string | null },
+  oauth: OAuth,
 ): void {
-  const state = readState();
+  const state = readState(PATHS);
   const cur = state.accounts[name] ?? emptyCache();
-  state.accounts[name] = {
-    ...cur,
-    email: profile.email ?? cur.email,
-    displayName: profile.displayName ?? cur.displayName,
-    uuid: profile.uuid ?? cur.uuid ?? null,
-  };
-  writeState(state);
+  state.accounts[name] = mergeProfileIntoCache(cur, profile, oauth);
+  writeState(PATHS, state);
 }
 
 /** Toggle inRotation for a slot, persist immediately, return new value. */
 function toggleRotationInState(name: string): boolean {
-  const state = readState();
+  const state = readState(PATHS);
   const cur = state.accounts[name] ?? emptyCache();
   const next = !(cur.inRotation ?? true);
   state.accounts[name] = { ...cur, inRotation: next };
-  writeState(state);
+  writeState(PATHS, state);
   return next;
 }
 
 /** Cache usage score + lastUsageAt for a slot. */
 function cacheUsageInState(name: string, score: number | null, at: number): void {
-  const state = readState();
+  const state = readState(PATHS);
   const cur = state.accounts[name] ?? emptyCache();
   state.accounts[name] = { ...cur, score, lastUsageAt: at };
-  writeState(state);
+  writeState(PATHS, state);
 }
 
 /** Record a refresh failure for a slot (increments backoff counter). */
 function recordRefreshFailureInState(name: string, at: number): void {
-  const state = readState();
+  const state = readState(PATHS);
   const cur = state.accounts[name] ?? emptyCache();
   state.accounts[name] = {
     ...cur,
     refreshFailures: (cur.refreshFailures ?? 0) + 1,
     lastRefreshFailAt: at,
   };
-  writeState(state);
+  writeState(PATHS, state);
 }
 
 /** Clear refresh-failure backoff for a slot after a successful refresh. */
 function clearRefreshFailureInState(name: string): void {
-  const state = readState();
+  const state = readState(PATHS);
   const cur = state.accounts[name] ?? emptyCache();
   if (!cur.refreshFailures && !cur.lastRefreshFailAt) return;
   state.accounts[name] = { ...cur, refreshFailures: 0, lastRefreshFailAt: null };
-  writeState(state);
+  writeState(PATHS, state);
 }
 
-function setLastAutoSwitchAt(at: number): void {
-  const state = readState();
-  state.lastAutoSwitchAt = at;
-  writeState(state);
+/**
+ * Restamp a slot's identity fingerprint to its current token. Called after an
+ * in-place token refresh (same account, rotated token) so the rotated token
+ * still matches the cached identity and a later load does NOT wrongly clear the
+ * email. Identity (email/uuid) is unchanged.
+ */
+function restampFingerprintInState(name: string, oauth: OAuth): void {
+  const state = readState(PATHS);
+  const cur = state.accounts[name] ?? emptyCache();
+  const fp = identityFingerprint(oauth);
+  if (cur.identityFingerprint === fp) return;
+  state.accounts[name] = { ...cur, identityFingerprint: fp };
+  writeState(PATHS, state);
 }
 
 // ---------------------------------------------------------------------------
-// Atomic writes (same-dir temp + rename, mode 0600)
+// Atomic credential copy (same-dir temp + rename, mode 0600)
 // ---------------------------------------------------------------------------
 function atomicCopy(src: string, dst: string): void {
   const data = readFileSync(src);
   atomicWriteBuffer(dst, data);
-}
-
-function atomicWriteBuffer(dst: string, data: Buffer | string): void {
-  const tmp = `${dst}.tmp.${process.pid}.${Date.now()}`;
-  writeFileSync(tmp, data, { mode: CRED_MODE });
-  chmodSync(tmp, CRED_MODE);
-  renameSync(tmp, dst);
 }
 
 /**
@@ -384,10 +201,10 @@ async function performSwitchSafe(
     }
     atomicCopy(slotPath(target), ACTIVE_FILE);
     chmodSync(ACTIVE_FILE, CRED_MODE);
-    const state = readState();
+    const state = readState(PATHS);
     state.active = target;
     if (stampAutoSwitchAt !== undefined) state.lastAutoSwitchAt = stampAutoSwitchAt;
-    writeState(state);
+    writeState(PATHS, state);
   } finally {
     if (release) await release().catch(() => {});
   }
@@ -434,242 +251,6 @@ async function refreshAccount(
     if (release) await release().catch(() => {});
   }
   return fresh;
-}
-
-// ---------------------------------------------------------------------------
-// Usage fetch
-// ---------------------------------------------------------------------------
-function elapsedPct(resetsAtIso: string, windowMs: number, now: number): number {
-  const resetsAt = new Date(resetsAtIso).getTime();
-  if (!Number.isFinite(resetsAt)) return 0;
-  const elapsed = 1 - (resetsAt - now) / windowMs;
-  return Math.max(0, Math.min(100, Math.round(elapsed * 100)));
-}
-
-// When the API rate-limits us (429), don't keep hammering: hold off all usage
-// GETs until this timestamp (honoring Retry-After when the server sends it).
-let usageBackoffUntil = 0;
-
-function parseRetryAfterMs(res: Response): number {
-  const h = res.headers.get("retry-after");
-  if (h) {
-    const secs = Number(h);
-    if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
-    const date = Date.parse(h);
-    if (Number.isFinite(date)) return Math.max(0, date - Date.now());
-  }
-  return 5000; // sane default backoff if no header
-}
-
-async function fetchUsage(oauth: OAuth): Promise<Usage> {
-  // Skip a guaranteed-failing call for already-expired tokens.
-  if (oauth.expiresAt && oauth.expiresAt < Date.now()) return "error";
-  // Respect an active rate-limit backoff window.
-  if (Date.now() < usageBackoffUntil) return "error";
-  try {
-    const res = await fetch(USAGE_URL, {
-      headers: { ...USAGE_HEADERS, Authorization: `Bearer ${oauth.accessToken}` },
-    });
-    if (res.status === 429) {
-      usageBackoffUntil = Date.now() + parseRetryAfterMs(res);
-      return "error";
-    }
-    if (!res.ok) return "error";
-    const body = (await res.json()) as {
-      five_hour?: { utilization: number; resets_at: string };
-      seven_day?: { utilization: number; resets_at: string };
-    };
-    if (!body.five_hour || !body.seven_day) return "error";
-    const now = Date.now();
-    return {
-      fiveHour: {
-        use: Math.round(body.five_hour.utilization),
-        elapsed: elapsedPct(body.five_hour.resets_at, FIVE_HOUR_MS, now),
-      },
-      sevenDay: {
-        use: Math.round(body.seven_day.utilization),
-        elapsed: elapsedPct(body.seven_day.resets_at, SEVEN_DAY_MS, now),
-      },
-    };
-  } catch {
-    return "error";
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Profile fetch (email/display name). Bearer auth -> only call with a valid token.
-// ---------------------------------------------------------------------------
-type Profile = { email: string | null; displayName: string | null; uuid: string | null };
-
-async function fetchProfile(oauth: OAuth): Promise<Profile | null> {
-  if (oauth.expiresAt && oauth.expiresAt < Date.now()) return null;
-  try {
-    const res = await fetch(PROFILE_URL, {
-      headers: {
-        Authorization: `Bearer ${oauth.accessToken}`,
-        "Content-Type": "application/json",
-      },
-    });
-    if (!res.ok) return null;
-    const body = (await res.json()) as {
-      account?: { email?: string; display_name?: string; uuid?: string };
-    };
-    const acct = body.account;
-    if (!acct) return null;
-    return {
-      email: acct.email ?? null,
-      displayName: acct.display_name ?? null,
-      uuid: acct.uuid ?? null,
-    };
-  } catch {
-    return null;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Display helpers
-// ---------------------------------------------------------------------------
-function tierLabel(oauth: OAuth): string {
-  const tier = oauth.rateLimitTier ?? "";
-  const map: Record<string, string> = {
-    default_claude_max_20x: "Max 20x",
-    default_claude_max_5x: "Max 5x",
-    max_20x: "Max 20x",
-    max_5x: "Max 5x",
-    default_claude_pro: "Pro",
-    pro: "Pro",
-    free: "Free",
-  };
-  if (map[tier]) return map[tier];
-  // Best-effort: strip known prefix, prettify.
-  const stripped = tier.replace(/^default_claude_/, "").replace(/_/g, " ");
-  if (stripped) {
-    return stripped.replace(/\bmax\b/i, "Max").replace(/\b(\d+x)\b/, "$1");
-  }
-  return oauth.subscriptionType ?? "—";
-}
-
-function expiresLabel(expiresAt: number): string {
-  if (!expiresAt) return "—";
-  const diff = expiresAt - Date.now();
-  if (diff <= 0) return "expired";
-  const mins = Math.round(diff / 60000);
-  if (mins < 60) return `in ${mins}m`;
-  const hrs = Math.round(mins / 60);
-  if (hrs < 48) return `in ${hrs}h`;
-  const days = Math.round(hrs / 24);
-  return `in ${days}d`;
-}
-
-// ---------------------------------------------------------------------------
-// Layout: columns are plain strings except Usage which is built from fragments.
-// We compute widths over the plain-text length of every cell so the box stays
-// aligned, then render colored fragments padded to that width.
-// ---------------------------------------------------------------------------
-type Fragment = { text: string; color?: string };
-
-type DisplayRow = {
-  name: string;
-  inRotation: boolean;
-  cells: {
-    account: string;
-    active: string;
-    rotation: string;
-    tier: string;
-    usage: Fragment[];
-    expires: string;
-  };
-};
-
-const HEADERS = {
-  account: "Account",
-  active: "Active",
-  rotation: "Rot",
-  tier: "Tier",
-  usage: "Usage",
-  expires: "Expires",
-};
-const COL_ORDER: (keyof typeof HEADERS)[] = [
-  "account",
-  "active",
-  "rotation",
-  "tier",
-  "usage",
-  "expires",
-];
-
-function fragLen(frags: Fragment[]): number {
-  return frags.reduce((n, f) => n + f.text.length, 0);
-}
-
-function pad(text: string, width: number): string {
-  return text + " ".repeat(Math.max(0, width - text.length));
-}
-
-function buildUsageFragments(usage: Usage): Fragment[] {
-  if (usage === "loading") return [{ text: "…" }];
-  if (usage === "error") return [{ text: "—" }];
-  const win = (w: Window): Fragment[] => [
-    { text: `${w.use}%`, color: w.use > w.elapsed ? "red" : "green" },
-    { text: `/${w.elapsed}%` },
-  ];
-  return [
-    { text: "5h: " },
-    ...win(usage.fiveHour),
-    { text: "  7d: " },
-    ...win(usage.sevenDay),
-  ];
-}
-
-function accountLabel(slot: Slot): string {
-  // Slot name is the identity (always shown); email is the optional extra.
-  const email = slot.cache.email;
-  return email ? `${slot.name} (${email})` : slot.name;
-}
-
-function buildRows(slots: Slot[], active: string | null): DisplayRow[] {
-  return slots.map((s) => {
-    const inRotation = s.cache.inRotation !== false;
-    return {
-      name: s.name,
-      inRotation,
-      cells: {
-        account: accountLabel(s),
-        active: s.name === active ? "●" : "",
-        rotation: inRotation ? "◉" : "○",
-        tier: tierLabel(s.oauth),
-        usage: buildUsageFragments(s.usage),
-        expires: expiresLabel(s.oauth.expiresAt),
-      },
-    };
-  });
-}
-
-function computeWidths(rows: DisplayRow[]): Record<keyof typeof HEADERS, number> {
-  const w = {} as Record<keyof typeof HEADERS, number>;
-  for (const col of COL_ORDER) {
-    let max = HEADERS[col].length;
-    for (const r of rows) {
-      const cell = r.cells[col];
-      const len = col === "usage" ? fragLen(cell as Fragment[]) : (cell as string).length;
-      max = Math.max(max, len);
-    }
-    w[col] = max;
-  }
-  return w;
-}
-
-// ---------------------------------------------------------------------------
-// Slot hydration: attach cached profile from the state file to each slot.
-// ---------------------------------------------------------------------------
-function hydrateSlots(slots: Slot[], state: SwitcherState): Slot[] {
-  return slots.map((s) => ({ ...s, cache: state.accounts[s.name] ?? emptyCache() }));
-}
-
-function loadAll(): { slots: Slot[]; active: string | null } {
-  const raw = discoverSlots();
-  const state = loadState(raw);
-  return { slots: hydrateSlots(raw, state), active: state.active };
 }
 
 // ---------------------------------------------------------------------------
@@ -746,7 +327,7 @@ const Onboarding: React.FC<{
 
 function listSlotNamesSafe(): string[] {
   try {
-    return discoverSlots().map((s) => s.name);
+    return discoverSlots(PATHS).map((s) => s.name);
   } catch {
     return [];
   }
@@ -849,19 +430,11 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
     if (slot.cache.email) return;
     void fetchProfile(slot.oauth).then((profile) => {
       if (cancelled || !profile) return;
-      cacheProfile(active, profile);
+      cacheProfile(active, profile, slot.oauth);
       setSlots((prev) =>
         prev.map((s) =>
           s.name === active
-            ? {
-                ...s,
-                cache: {
-                  ...s.cache,
-                  email: profile.email ?? s.cache.email,
-                  displayName: profile.displayName ?? s.cache.displayName,
-                  uuid: profile.uuid ?? s.cache.uuid ?? null,
-                },
-              }
+            ? { ...s, cache: mergeProfileIntoCache(s.cache, profile, s.oauth) }
             : s,
         ),
       );
@@ -876,19 +449,11 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
   async function refreshProfileFor(name: string, oauth: OAuth): Promise<void> {
     const profile = await fetchProfile(oauth);
     if (!profile) return;
-    cacheProfile(name, profile);
+    cacheProfile(name, profile, oauth);
     setSlots((prev) =>
       prev.map((s) =>
         s.name === name
-          ? {
-              ...s,
-              cache: {
-                ...s.cache,
-                email: profile.email ?? s.cache.email,
-                displayName: profile.displayName ?? s.cache.displayName,
-                uuid: profile.uuid ?? s.cache.uuid ?? null,
-              },
-            }
+          ? { ...s, cache: mergeProfileIntoCache(s.cache, profile, oauth) }
           : s,
       ),
     );
@@ -901,9 +466,18 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
     setFlash(`refreshing ${name}…`);
     try {
       const fresh = await refreshAccount(name, slot.oauth, name === active);
+      // Rotated token, same account -> keep the cached identity valid.
+      restampFingerprintInState(name, fresh);
       setSlots((prev) =>
         prev.map((s) =>
-          s.name === name ? { ...s, oauth: fresh, usage: "loading" } : s,
+          s.name === name
+            ? {
+                ...s,
+                oauth: fresh,
+                usage: "loading",
+                cache: { ...s.cache, identityFingerprint: identityFingerprint(fresh) },
+              }
+            : s,
         ),
       );
       const usage = await fetchUsage(fresh);
@@ -925,7 +499,7 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
     try {
       performSwitch(target, active);
       setFlash(`switched → ${target}`);
-      const { slots: fresh, active: newActive } = loadAll();
+      const { slots: fresh, active: newActive } = loadAll(PATHS);
       setSlots(fresh);
       setActive(newActive);
       setReloadNonce((n) => n + 1);
@@ -943,8 +517,8 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
     try {
       saveActiveToSlot(CLAUDE_DIR, label);
       setActiveInState(label);
-      if (profile) cacheProfile(label, profile);
-      const { slots: fresh, active: newActive } = loadAll();
+      if (profile) cacheProfile(label, profile, readOAuth(slotPath(label)));
+      const { slots: fresh, active: newActive } = loadAll(PATHS);
       setSlots(fresh);
       setActive(newActive);
       setPhase("table");
@@ -1011,8 +585,18 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
           if (!slot) return null;
           // Throws on failure -> runUsagePass marks refreshFailed.
           const fresh = await refreshAccount(name, slot.oauth, false);
+          // Rotated token, same account -> keep the cached identity valid.
+          restampFingerprintInState(name, fresh);
           setSlots((prev) =>
-            prev.map((s) => (s.name === name ? { ...s, oauth: fresh } : s)),
+            prev.map((s) =>
+              s.name === name
+                ? {
+                    ...s,
+                    oauth: fresh,
+                    cache: { ...s.cache, identityFingerprint: identityFingerprint(fresh) },
+                  }
+                : s,
+            ),
           );
           return { expiresAt: fresh.expiresAt };
         },
@@ -1077,7 +661,7 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
           inRotation: s.cache.inRotation !== false,
           score: usageScore(s.usage),
         }));
-        const state = readState();
+        const state = readState(PATHS);
         const decision = decideAutoSwitch({
           accounts,
           active: activeRef.current,
@@ -1087,7 +671,7 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
         if (decision.target) {
           const from = activeRef.current;
           await performSwitchSafe(decision.target, from, Date.now());
-          const { slots: reloaded, active: newActive } = loadAll();
+          const { slots: reloaded, active: newActive } = loadAll(PATHS);
           setSlots(reloaded);
           setActive(newActive);
           setReloadNonce((n) => n + 1);
@@ -1326,14 +910,22 @@ const App: React.FC<AppProps> = ({ initial, needsOnboarding }) => {
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
-function main(): void {
+async function main(): Promise<void> {
+  // CLI dispatch first. Non-null exit code => the CLI handled the invocation.
+  const code = await runCli(process.argv.slice(2));
+  if (code !== null) {
+    process.exit(code);
+  }
+
+  // No args -> launch the TUI (unchanged behavior below).
+
   // No credentials at all → friendly message, exit cleanly.
-  if (!existsSync(ACTIVE_FILE) && discoverSlots().length === 0) {
+  if (!existsSync(ACTIVE_FILE) && discoverSlots(PATHS).length === 0) {
     console.error("No Claude credentials found — run `claude` and log in first.");
     process.exit(0);
   }
 
-  const initial = loadAll();
+  const initial = loadAll(PATHS);
 
   // Onboarding only when there's an active credentials file that matches no
   // slot AND we couldn't resolve an active slot (genuinely untracked).
