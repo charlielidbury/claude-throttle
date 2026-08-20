@@ -6,6 +6,7 @@
 # - With CLAUDE_THROTTLE unset/empty/zero/positive
 # - With/without per-session stats file
 # - With one or both windows present
+# - With/without the context_window block
 set -u
 
 REPO_ROOT="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
@@ -60,6 +61,38 @@ if sd_pct != "absent":
 payload = {"rate_limits": rl if rl else None}
 if with_sid == "yes":
     payload["session_id"] = "sess-A"
+print(json.dumps(payload))
+' "$@"
+}
+
+# Splice a context_window block into an existing input JSON.
+#
+#   $1 input_json
+#   $2 in-context tokens, or "none" for a null current_usage (cold start),
+#      or "absent" to omit context_window entirely
+#   $3 context_window_size
+#   $4 used_percentage, or "null" to force the fallback computation
+add_context() {
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+tokens, size, pct = sys.argv[2:5]
+if tokens != "absent":
+    cw = {"context_window_size": int(size)}
+    if tokens == "none":
+        cw["current_usage"] = None
+        cw["used_percentage"] = None
+    else:
+        # Split across the three fields the statusline must sum.
+        t = int(tokens)
+        cw["current_usage"] = {
+            "input_tokens": t - (t // 2) - (t // 4),
+            "output_tokens": 50,
+            "cache_creation_input_tokens": t // 4,
+            "cache_read_input_tokens": t // 2,
+        }
+        cw["used_percentage"] = None if pct == "null" else float(pct)
+    payload["context_window"] = cw
 print(json.dumps(payload))
 ' "$@"
 }
@@ -268,6 +301,73 @@ test_window_incomplete_dropped() {
   assert_stdout_eq "thr:0.7 | 7d:(79%/92%)"
 }
 
+test_context_window() {
+  clear_stats
+  local input
+  input=$(add_context "$INPUT_FULL" 213000 1000000 21)
+  run_statusline "$input" ""
+  assert_stdout_eq "thr:off | 5h:(56%/80%) 7d:(79%/92%) | 213k (21%)"
+}
+
+test_context_before_session_block() {
+  clear_stats
+  write_stats "sess-A" 5 1920
+  local input
+  input=$(add_context "$INPUT_FULL" 213000 1000000 21)
+  run_statusline "$input" "0.7"
+  assert_stdout_eq "thr:0.7 | 5h:(56%/80%) 7d:(79%/92%) | 213k (21%) | session:32m (n=5)"
+}
+
+test_context_absent_field() {
+  clear_stats
+  # Older Claude Code versions don't send context_window at all.
+  run_statusline "$INPUT_FULL" ""
+  assert_stdout_eq "thr:off | 5h:(56%/80%) 7d:(79%/92%)"
+}
+
+test_context_cold_start() {
+  clear_stats
+  # current_usage is null until the first API response.
+  local input
+  input=$(add_context "$INPUT_FULL" none 1000000 0)
+  run_statusline "$input" ""
+  assert_stdout_eq "thr:off | 5h:(56%/80%) 7d:(79%/92%)"
+}
+
+test_context_without_rate_limits() {
+  clear_stats
+  local input
+  input=$(add_context "$INPUT_COLD" 213000 1000000 21)
+  run_statusline "$input" ""
+  assert_stdout_eq "thr:off | 213k (21%)"
+}
+
+test_context_small_token_count() {
+  clear_stats
+  # Under 1k tokens: raw count, no "k" suffix.
+  local input
+  input=$(add_context "$INPUT_ONLY_5H" 840 200000 0)
+  run_statusline "$input" "0.7"
+  assert_stdout_eq "thr:0.7 | 5h:(56%/80%) | 840 (0%)"
+}
+
+test_context_pct_computed_when_missing() {
+  clear_stats
+  # used_percentage null -> fall back to tokens / context_window_size.
+  local input
+  input=$(add_context "$INPUT_ONLY_5H" 50000 200000 null)
+  run_statusline "$input" "0.7"
+  assert_stdout_eq "thr:0.7 | 5h:(56%/80%) | 50k (25%)"
+}
+
+test_context_200k_window() {
+  clear_stats
+  local input
+  input=$(add_context "$INPUT_ONLY_5H" 160000 200000 80)
+  run_statusline "$input" "0.7"
+  assert_stdout_eq "thr:0.7 | 5h:(56%/80%) | 160k (80%)"
+}
+
 # --- run all tests ---
 
 run "throttle off, full data"                  test_throttle_off
@@ -291,6 +391,14 @@ run "window just started (0% elapsed)"         test_window_just_started
 run "window almost done (99% elapsed)"         test_window_almost_done
 run "resets_at in past treated as fresh"       test_resets_at_in_past_treated_as_fresh
 run "incomplete window silently dropped"       test_window_incomplete_dropped
+run "context window block"                     test_context_window
+run "context block precedes session block"     test_context_before_session_block
+run "no context_window field: block omitted"   test_context_absent_field
+run "cold start: context block omitted"        test_context_cold_start
+run "context block without rate limits"        test_context_without_rate_limits
+run "context: sub-1k token count"              test_context_small_token_count
+run "context: pct computed when null"          test_context_pct_computed_when_missing
+run "context: 200k window"                     test_context_200k_window
 
 echo
 echo "----"

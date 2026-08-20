@@ -52,13 +52,16 @@ Top Tip: If you want Agent A to have _priority_ over Agent B in terms of usage, 
 ## Status bar
 
 ```
-thr:0.7 | 5h:(56%/80%) 7d:(79%/92%) | session:32m (n=5)
+thr:0.7 | 5h:(56%/80%) 7d:(79%/92%) | 213k (21%) | session:32m (n=5)
 ```
 
 - `thr:N` — current multiplier (or `off`)
 - `5h:(usage%/window%)` — current utilization paired with elapsed
   fraction of the 5-hour window
 - `7d:` same for the 7-day window
+- `213k (21%)` — tokens currently in the context window, and what
+  fraction of the model's window that is (omitted until the first API
+  response)
 - `session:DUR (n=N)` — total sleep time + throttle event count for the
   current session (omitted until the first sleep)
 

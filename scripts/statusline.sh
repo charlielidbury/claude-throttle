@@ -6,11 +6,14 @@
 # hook reads.
 #
 # Side-outputs a compact status string for the terminal status bar:
-#   "thr:0.7 | 5h:(56%/80%) 7d:(79%/92%) | session:32m (n=5)"
+#   "thr:0.7 | 5h:(56%/80%) 7d:(79%/92%) | 213k (21%) | session:32m (n=5)"
 # Format per window: "(usage%/window%)" — current utilization /
 # elapsed fraction of the billing window. thr:off when CLAUDE_THROTTLE
-# is unset/zero/non-numeric. The session block appears only when
-# throttling is on and at least one sleep has occurred this session.
+# is unset/zero/non-numeric. The context block is the live context
+# window occupancy ("<tokens> (<pct of window>%)"), from the
+# context_window field Claude Code pipes in; it is absent until the
+# first API response. The session block appears only when throttling
+# is on and at least one sleep has occurred this session.
 set -u
 
 CACHE_FILE="${CLAUDE_THROTTLE_CACHE:-/tmp/claude-throttle-cache.json}"
@@ -73,6 +76,33 @@ if fh_usage is not None:
 if sd_usage is not None:
     window_parts.append(f"7d:({sd_usage:.0f}%/{sd_window:.0f}%)")
 
+# context window block (absent until the first API response)
+cw = d.get("context_window") or {}
+usage = cw.get("current_usage") or {}
+
+def num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+ctx_tokens = None
+if usage:
+    ctx_tokens = (
+        num(usage.get("input_tokens"))
+        + num(usage.get("cache_creation_input_tokens"))
+        + num(usage.get("cache_read_input_tokens"))
+    )
+
+ctx_pct = cw.get("used_percentage")
+if not isinstance(ctx_pct, (int, float)) or isinstance(ctx_pct, bool):
+    ctx_pct = None
+size = cw.get("context_window_size")
+if ctx_pct is None and ctx_tokens is not None and isinstance(size, (int, float)) and size > 0:
+    ctx_pct = min(100.0, max(0.0, (ctx_tokens / size) * 100.0))
+
+context_part = None
+if ctx_tokens is not None:
+    tok = f"{ctx_tokens / 1000:.0f}k" if ctx_tokens >= 1000 else f"{ctx_tokens:.0f}"
+    context_part = f"{tok} ({ctx_pct:.0f}%)" if ctx_pct is not None else tok
+
 # session stats block (only when throttle on AND at least one sleep)
 session_part = None
 if thr > 0:
@@ -105,6 +135,8 @@ if thr > 0:
 segments = [thr_part]
 if window_parts:
     segments.append(" ".join(window_parts))
+if context_part:
+    segments.append(context_part)
 if session_part:
     segments.append(session_part)
 
