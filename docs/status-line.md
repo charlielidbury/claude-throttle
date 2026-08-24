@@ -198,6 +198,22 @@ percentage-of-quota directly, so the user only needs to set
   The throttle hook could optionally pace against the weekly window in
   addition to the 5-hour window. Worth considering as a v2 feature.
 
+- **No per-model windows.** `rate_limits` covers the aggregate windows
+  only. Claude Code (checked against 2.1.237) builds them from the
+  `anthropic-ratelimit-unified-{5h,7d}-utilization` response headers,
+  which have no per-model buckets, and its statusLine payload builder
+  projects exactly `five_hour` and `seven_day`. The Fable weekly limit
+  is therefore invisible here; it exists only in the `/api/oauth/usage`
+  payload as a `limits[]` entry of kind `weekly_scoped` whose
+  `scope.model.display_name` is `Fable`. `scripts/fable-usage.py`
+  fetches it out-of-band for the status bar — see
+  `rejected-endpoint-approach.md`.
+
+  The same Claude Code build already validates a `rate_limits.model_scoped`
+  array (`{display_name, utilization, resets_at}`) in its usage payload
+  schema, so per-model windows may reach statusLine eventually. The
+  statusline reads that array first and skips the fetch when it is there.
+
 ## Recommendation
 
 Pivot the v1 design to use statusLine as the data source. The plan's

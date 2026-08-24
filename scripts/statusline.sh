@@ -6,17 +6,23 @@
 # hook reads.
 #
 # Side-outputs a compact status string for the terminal status bar:
-#   "thr:0.7 | 5h:(56%/80%) 7d:(79%/92%) | 213k (21%) | session:32m (n=5)"
+#   "thr:0.7 | 5h:(56%/80%) 7d:(79%,90%/92%) | 213k (21%) | session:32m (n=5)"
 # Format per window: "(usage%/window%)" — current utilization /
-# elapsed fraction of the billing window. thr:off when CLAUDE_THROTTLE
-# is unset/zero/non-numeric. The context block is the live context
-# window occupancy ("<tokens> (<pct of window>%)"), from the
-# context_window field Claude Code pipes in; it is absent until the
-# first API response. The session block appears only when throttling
-# is on and at least one sleep has occurred this session.
+# elapsed fraction of the billing window. The 7-day block carries a
+# second usage number when the Fable weekly limit is known
+# ("(all-models%,fable%/window%)"); see fable-usage.py for where that
+# comes from. thr:off when CLAUDE_THROTTLE is unset/zero/non-numeric.
+# The context block is the live context window occupancy
+# ("<tokens> (<pct of window>%)"), from the context_window field Claude
+# Code pipes in; it is absent until the first API response. The session
+# block appears only when throttling is on and at least one sleep has
+# occurred this session.
 set -u
 
 CACHE_FILE="${CLAUDE_THROTTLE_CACHE:-/tmp/claude-throttle-cache.json}"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# Background refresher for the Fable weekly percentage (see below).
+export CLAUDE_THROTTLE_FABLE_FETCHER="${CLAUDE_THROTTLE_FABLE_FETCHER:-$SCRIPT_DIR/fable-usage.py}"
 input=$(cat)
 
 # Atomic cache write: write to .tmp, then mv. Avoids the throttle hook
@@ -34,7 +40,7 @@ print(json.dumps(out))
 
 # Visible status bar text.
 echo "$input" | python3 -c '
-import json, os, re, sys, time
+import hashlib, json, os, re, subprocess, sys, time
 
 try:
     d = json.load(sys.stdin)
@@ -43,6 +49,14 @@ except Exception:
 
 now = time.time()
 rl = d.get("rate_limits") or {}
+
+
+def env_float(name, default):
+    try:
+        return float(os.environ.get(name) or "")
+    except ValueError:
+        return default
+
 
 def window_pcts(key, window_s):
     w = rl.get(key) or {}
@@ -60,6 +74,106 @@ def window_pcts(key, window_s):
 fh_usage, fh_window = window_pcts("five_hour", 18000)
 sd_usage, sd_window = window_pcts("seven_day", 604800)
 
+
+# --- Fable weekly window ---------------------------------------------
+# Claude Code does not pipe this one: rate_limits is built from the
+# unified rate-limit response headers, which carry no per-model bucket.
+# scripts/fable-usage.py fetches it from the usage endpoint in the
+# background and leaves it in a cache file; here we only read that cache,
+# so the status bar never waits on the network. If a future Claude Code
+# starts sending model_scoped entries, those win and the cache is unused.
+def model_scoped_pct(name):
+    entries = rl.get("model_scoped")
+    if not isinstance(entries, list):
+        return None
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        dn = e.get("display_name")
+        if not isinstance(dn, str) or dn.strip().lower() != name:
+            continue
+        u = e.get("utilization")
+        if isinstance(u, (int, float)) and not isinstance(u, bool):
+            return float(u)
+    return None
+
+
+def spawn_fable_refresh():
+    fetcher = os.environ.get("CLAUDE_THROTTLE_FABLE_FETCHER") or ""
+    if not fetcher or not os.path.exists(fetcher):
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, fetcher],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
+def cached_fable_pct():
+    cred = os.environ.get("CLAUDE_CREDENTIALS")
+    if not cred:
+        base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
+            os.path.expanduser("~"), ".claude"
+        )
+        cred = os.path.join(base, ".credentials.json")
+    try:
+        with open(cred) as f:
+            token = (json.load(f).get("claudeAiOauth") or {}).get("accessToken")
+    except (OSError, ValueError, AttributeError):
+        return None  # no credentials to fetch with (keychain, API key, ...)
+    if not isinstance(token, str) or not token:
+        return None
+    # Tie the cached number to the token that produced it: after an
+    # account switch the old number is hidden rather than shown as if it
+    # belonged to the new account.
+    fp = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+    path = (
+        os.environ.get("CLAUDE_THROTTLE_FABLE_CACHE")
+        or "/tmp/claude-throttle-fable.json"
+    )
+    try:
+        with open(path) as f:
+            c = json.load(f)
+    except (OSError, ValueError):
+        c = {}
+    if not isinstance(c, dict) or c.get("token_fp") != fp:
+        c = {}
+
+    attempted = c.get("attempted_at")
+    ttl = env_float("CLAUDE_THROTTLE_FABLE_TTL", 300.0)
+    if not isinstance(attempted, (int, float)) or now - attempted >= ttl:
+        spawn_fable_refresh()
+
+    fetched = c.get("fetched_at")
+    pct = c.get("fable_pct")
+    max_age = env_float("CLAUDE_THROTTLE_FABLE_MAX_AGE", 900.0)
+    if not isinstance(fetched, (int, float)) or now - fetched > max_age:
+        return None  # never fetched, or too stale to be worth showing
+    if not isinstance(pct, (int, float)) or isinstance(pct, bool):
+        return None  # account has no Fable bucket
+    return float(pct)
+
+
+def fable_pct():
+    if (os.environ.get("CLAUDE_THROTTLE_FABLE") or "").strip().lower() in (
+        "0",
+        "off",
+        "false",
+        "no",
+    ):
+        return None
+    live = model_scoped_pct("fable")
+    return live if live is not None else cached_fable_pct()
+
+
+fb_usage = fable_pct()
+
 throttle_str = (os.environ.get("CLAUDE_THROTTLE") or "").strip()
 try:
     thr = float(throttle_str)
@@ -74,7 +188,12 @@ window_parts = []
 if fh_usage is not None:
     window_parts.append(f"5h:({fh_usage:.0f}%/{fh_window:.0f}%)")
 if sd_usage is not None:
-    window_parts.append(f"7d:({sd_usage:.0f}%/{sd_window:.0f}%)")
+    if fb_usage is not None:
+        window_parts.append(
+            f"7d:({sd_usage:.0f}%,{fb_usage:.0f}%/{sd_window:.0f}%)"
+        )
+    else:
+        window_parts.append(f"7d:({sd_usage:.0f}%/{sd_window:.0f}%)")
 
 # context window block (absent until the first API response)
 cw = d.get("context_window") or {}

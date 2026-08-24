@@ -7,6 +7,7 @@
 # - With/without per-session stats file
 # - With one or both windows present
 # - With/without the context_window block
+# - With/without a cached Fable weekly percentage
 set -u
 
 REPO_ROOT="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
@@ -23,6 +24,29 @@ trap 'rm -rf "$WORK"' EXIT
 CACHE_FILE="$WORK/cache.json"
 STATS_DIR="$WORK/stats"
 mkdir -p "$STATS_DIR"
+
+FABLE_CACHE="$WORK/fable.json"
+CRED_FILE="$WORK/credentials.json"
+SPAWN_LOG="$WORK/fable-spawn.log"
+STUB_FETCHER="$WORK/stub-fetcher.py"
+# Overrides the credentials file for a single test (empty = the fake one).
+CREDS=""
+
+# Fake credentials. The statusline only reads the access token, which it
+# hashes to tie a cached Fable percentage to one account.
+python3 -c '
+import json, sys
+with open(sys.argv[1], "w") as f:
+    json.dump({"claudeAiOauth": {"accessToken": "token-A", "expiresAt": 9999999999000}}, f)
+' "$CRED_FILE"
+
+# Stand-in for scripts/fable-usage.py: records that it was spawned rather
+# than going near the network.
+cat > "$STUB_FETCHER" <<'PYEOF'
+import os
+with open(os.environ["FABLE_SPAWN_LOG"], "a") as f:
+    f.write("spawned\n")
+PYEOF
 
 TESTS_RUN=0
 TESTS_FAILED=0
@@ -97,6 +121,45 @@ print(json.dumps(payload))
 ' "$@"
 }
 
+# Splice a model_scoped array into an existing input JSON. Claude Code
+# does not send one today; this covers the day it starts.
+#
+#   $1 input_json  $2 display_name  $3 utilization
+add_model_scoped() {
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+rl = payload.get("rate_limits") or {}
+rl["model_scoped"] = [
+    {"display_name": sys.argv[2], "utilization": float(sys.argv[3]), "resets_at": None}
+]
+payload["rate_limits"] = rl
+print(json.dumps(payload))
+' "$@"
+}
+
+# Write the cache scripts/fable-usage.py would have written.
+#
+#   $1 fable_pct     number, or "null" (account with no Fable bucket)
+#   $2 fetched_age   seconds since the last successful fetch
+#   $3 attempted_age seconds since the last fetch attempt
+#   $4 token         account the cache belongs to (default token-A)
+write_fable_cache() {
+  python3 -c '
+import hashlib, json, sys, time
+path, pct, fetched_age, attempted_age, token = sys.argv[1:6]
+now = time.time()
+entry = {
+    "attempted_at": now - float(attempted_age),
+    "fetched_at": now - float(fetched_age),
+    "fable_pct": None if pct == "null" else float(pct),
+    "token_fp": hashlib.sha256(token.encode("utf-8")).hexdigest()[:16],
+}
+with open(path, "w") as f:
+    json.dump(entry, f)
+' "$FABLE_CACHE" "$1" "$2" "$3" "${4:-token-A}"
+}
+
 write_stats() {
   local sid="$1" count="$2" total_s="$3"
   python3 -c '
@@ -122,10 +185,16 @@ LAST_STDOUT=""
 run_statusline() {
   local input_json="$1"
   local throttle_val="${2:-}"
+  local fable_val="${3:-}"
   LAST_STDOUT=$(
     CLAUDE_THROTTLE="$throttle_val" \
     CLAUDE_THROTTLE_CACHE="$CACHE_FILE" \
     CLAUDE_THROTTLE_STATS_DIR="$STATS_DIR" \
+    CLAUDE_THROTTLE_FABLE="$fable_val" \
+    CLAUDE_THROTTLE_FABLE_CACHE="$FABLE_CACHE" \
+    CLAUDE_THROTTLE_FABLE_FETCHER="$STUB_FETCHER" \
+    CLAUDE_CREDENTIALS="${CREDS:-$CRED_FILE}" \
+    FABLE_SPAWN_LOG="$SPAWN_LOG" \
     "$STATUSLINE_SH" <<<"$input_json" 2>/dev/null
   )
 }
@@ -151,6 +220,28 @@ run() {
 }
 
 clear_stats() { rm -f "$STATS_DIR"/*.json; }
+
+# The Fable refresh is detached, so a spawn from the previous test can
+# still be in flight — drain before clearing.
+clear_fable() { sleep 0.1; rm -f "$FABLE_CACHE" "$SPAWN_LOG"; }
+
+assert_spawned() {
+  local i
+  for i in $(seq 20); do
+    [[ -s "$SPAWN_LOG" ]] && return 0
+    sleep 0.1
+  done
+  echo "  FAIL: expected a background Fable refresh, none ran"
+  return 1
+}
+
+assert_not_spawned() {
+  sleep 0.3   # long enough that a spawn would have landed
+  if [[ -s "$SPAWN_LOG" ]]; then
+    echo "  FAIL: unexpected background Fable refresh"
+    return 1
+  fi
+}
 
 # --- test cases ---
 
@@ -368,6 +459,104 @@ test_context_200k_window() {
   assert_stdout_eq "thr:0.7 | 5h:(56%/80%) | 160k (80%)"
 }
 
+test_fable_shown() {
+  clear_stats; clear_fable
+  write_fable_cache 90 30 30
+  run_statusline "$INPUT_FULL" ""
+  assert_stdout_eq "thr:off | 5h:(56%/80%) 7d:(79%,90%/92%)" || return 1
+  assert_not_spawned
+}
+
+test_fable_refresh_when_value_ages() {
+  clear_stats; clear_fable
+  # Value still displayable, attempt older than the 300s TTL: show it and
+  # kick off a refresh in the background.
+  write_fable_cache 90 600 600
+  run_statusline "$INPUT_FULL" ""
+  assert_stdout_eq "thr:off | 5h:(56%/80%) 7d:(79%,90%/92%)" || return 1
+  assert_spawned
+}
+
+test_fable_stale_hidden() {
+  clear_stats; clear_fable
+  # Past the 900s display cutoff — refreshes have been failing.
+  write_fable_cache 90 1200 1200
+  run_statusline "$INPUT_FULL" ""
+  assert_stdout_eq "thr:off | 5h:(56%/80%) 7d:(79%/92%)" || return 1
+  assert_spawned
+}
+
+test_fable_other_account_hidden() {
+  clear_stats; clear_fable
+  # Cached against a token the session no longer uses (account switch).
+  write_fable_cache 90 30 30 token-B
+  run_statusline "$INPUT_FULL" ""
+  assert_stdout_eq "thr:off | 5h:(56%/80%) 7d:(79%/92%)" || return 1
+  assert_spawned
+}
+
+test_fable_null_pct_hidden() {
+  clear_stats; clear_fable
+  # Fetched fine, account just has no Fable bucket: nothing to show and
+  # nothing to retry.
+  write_fable_cache null 30 30
+  run_statusline "$INPUT_FULL" ""
+  assert_stdout_eq "thr:off | 5h:(56%/80%) 7d:(79%/92%)" || return 1
+  assert_not_spawned
+}
+
+test_fable_refresh_when_cache_missing() {
+  clear_stats; clear_fable
+  run_statusline "$INPUT_FULL" ""
+  assert_stdout_eq "thr:off | 5h:(56%/80%) 7d:(79%/92%)" || return 1
+  assert_spawned
+}
+
+test_fable_disabled() {
+  clear_stats; clear_fable
+  write_fable_cache 90 30 30
+  run_statusline "$INPUT_FULL" "" "0"
+  assert_stdout_eq "thr:off | 5h:(56%/80%) 7d:(79%/92%)" || return 1
+  assert_not_spawned
+}
+
+test_fable_no_credentials() {
+  clear_stats; clear_fable
+  write_fable_cache 90 30 30
+  CREDS="$WORK/no-such-credentials.json"
+  run_statusline "$INPUT_FULL" ""
+  CREDS=""
+  assert_stdout_eq "thr:off | 5h:(56%/80%) 7d:(79%/92%)" || return 1
+  assert_not_spawned
+}
+
+test_fable_from_model_scoped() {
+  clear_stats; clear_fable
+  local input
+  input=$(add_model_scoped "$INPUT_FULL" Fable 84)
+  run_statusline "$input" ""
+  assert_stdout_eq "thr:off | 5h:(56%/80%) 7d:(79%,84%/92%)" || return 1
+  assert_not_spawned
+}
+
+test_fable_without_seven_day() {
+  clear_stats; clear_fable
+  # Fable rides along with the 7d block; no 7d data, nowhere to show it.
+  write_fable_cache 90 30 30
+  run_statusline "$INPUT_ONLY_5H" ""
+  assert_stdout_eq "thr:off | 5h:(56%/80%)"
+}
+
+test_fable_with_throttle_and_context() {
+  clear_stats; clear_fable
+  write_stats "sess-A" 5 1920
+  write_fable_cache 90 30 30
+  local input
+  input=$(add_context "$INPUT_FULL" 213000 1000000 21)
+  run_statusline "$input" "0.7"
+  assert_stdout_eq "thr:0.7 | 5h:(56%/80%) 7d:(79%,90%/92%) | 213k (21%) | session:32m (n=5)"
+}
+
 # --- run all tests ---
 
 run "throttle off, full data"                  test_throttle_off
@@ -399,6 +588,17 @@ run "context block without rate limits"        test_context_without_rate_limits
 run "context: sub-1k token count"              test_context_small_token_count
 run "context: pct computed when null"          test_context_pct_computed_when_missing
 run "context: 200k window"                     test_context_200k_window
+run "fable: cached pct shown in 7d block"      test_fable_shown
+run "fable: shown while refresh is due"        test_fable_refresh_when_value_ages
+run "fable: stale value hidden"                test_fable_stale_hidden
+run "fable: other account value hidden"        test_fable_other_account_hidden
+run "fable: null pct hidden, no refetch"       test_fable_null_pct_hidden
+run "fable: missing cache triggers refresh"    test_fable_refresh_when_cache_missing
+run "fable: CLAUDE_THROTTLE_FABLE=0 disables"  test_fable_disabled
+run "fable: no credentials, no fetch"          test_fable_no_credentials
+run "fable: model_scoped from statusLine JSON" test_fable_from_model_scoped
+run "fable: hidden when 7d window absent"      test_fable_without_seven_day
+run "fable: alongside throttle+context blocks" test_fable_with_throttle_and_context
 
 echo
 echo "----"

@@ -72,3 +72,19 @@ us.
 
 If any of these happen, this approach is the obvious fallback. The full
 recipe is preserved in this doc and `usage.sh` keeps working.
+
+## Where we did end up using it
+
+The Fable weekly limit (`limits[]`, kind `weekly_scoped`, scope
+`Fable`) has no statusLine equivalent, so the status bar gets it from
+this endpoint via `scripts/fable-usage.py`. The objections above are
+answered by keeping it strictly display-only:
+
+- **Undocumented** — if the shape changes, the number disappears from
+  the status bar and nothing else notices. Pacing never depends on it.
+- **Extra moving parts** — no token handling beyond reading the access
+  token and sending it. A 401 (expired token) is treated like any other
+  failed request; refreshing is deliberately not done here, since that
+  would rotate the token out from under the account switcher.
+- **Slower per call** — the fetch is detached and cached (300s TTL), so
+  the status bar only ever reads a file.

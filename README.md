@@ -52,13 +52,19 @@ Top Tip: If you want Agent A to have _priority_ over Agent B in terms of usage, 
 ## Status bar
 
 ```
-thr:0.7 | 5h:(56%/80%) 7d:(79%/92%) | 213k (21%) | session:32m (n=5)
+thr:0.7 | 5h:(56%/80%) 7d:(79%,90%/92%) | 213k (21%) | session:32m (n=5)
 ```
 
 - `thr:N` — current multiplier (or `off`)
 - `5h:(usage%/window%)` — current utilization paired with elapsed
   fraction of the 5-hour window
-- `7d:` same for the 7-day window
+- `7d:(all-models%,fable%/window%)` — same for the 7-day window, with the
+  Fable-only weekly limit as the second number. Claude Code does not pipe
+  that one to `statusLine`, so `scripts/fable-usage.py` fetches it from
+  `/api/oauth/usage` in the background (display only — the throttle still
+  paces off the statusLine data alone). The `,fable%` part is omitted
+  until the first fetch lands, on accounts with no Fable limit, and when
+  the credentials file is unreadable.
 - `213k (21%)` — tokens currently in the context window, and what
   fraction of the model's window that is (omitted until the first API
   response)
@@ -93,11 +99,17 @@ API response yet), the hook is a no-op.
 | `THROTTLE_LOG` | `~/.claude/throttle.log` | Log path. |
 | `CLAUDE_THROTTLE_CACHE` | `/tmp/claude-throttle-cache.json` | Cache path. |
 | `CLAUDE_THROTTLE_STATS_DIR` | `/tmp` | Per-session stats files live here. |
+| `CLAUDE_THROTTLE_FABLE` | unset | Set to `0`/`off` to drop the Fable number (no fetching). |
+| `CLAUDE_THROTTLE_FABLE_CACHE` | `/tmp/claude-throttle-fable.json` | Fable percentage cache. |
+| `CLAUDE_THROTTLE_FABLE_TTL` | 300 | Seconds between background usage fetches. |
+| `CLAUDE_THROTTLE_FABLE_MAX_AGE` | 900 | Hide the number once the cached value is older. |
+| `CLAUDE_CREDENTIALS` | `~/.claude/.credentials.json` | OAuth token used for the usage fetch. |
 
 ## Files
 
 - `scripts/statusline.sh` — writes cache + prints status bar text
 - `scripts/throttle.sh` — `PreToolUse` hook (reads cache, sleeps)
+- `scripts/fable-usage.py` — background refresher for the Fable weekly %
 - `install.sh` / `uninstall.sh` — manage `~/.claude/settings.json`
 - `usage.sh` — debug helper; prints raw `/api/oauth/usage` response
 - `docs/` — design notes, including the rejected endpoint approach
@@ -105,8 +117,9 @@ API response yet), the hook is a no-op.
 ## Tests
 
 ```sh
-bash tests/test-throttle.sh     # 24 unit tests for the hook
-bash tests/test-statusline.sh   # 21 unit tests for the status writer
+bash tests/test-throttle.sh     # 25 unit tests for the hook
+bash tests/test-statusline.sh   # 40 unit tests for the status writer
+bash tests/test-fable-usage.sh  # 11 unit tests for the Fable refresher
 ```
 
 ## Uninstall
